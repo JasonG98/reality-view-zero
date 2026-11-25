@@ -32,3 +32,65 @@ def test_doctor_arguments_and_exit_code(monkeypatch: pytest.MonkeyPatch, passed:
     assert exit_code == expected_exit_code
     load_config.assert_called_once_with("configs/mac_debug.yaml", ["sim.drone_res=64", "train.batch=8"])
     run_doctor.assert_called_once_with(config, download=True)
+
+
+def test_gen_data_arguments_and_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = Config()
+    load_config = Mock(return_value=config)
+    generate_many = Mock()
+    monkeypatch.setattr(cli, "load_config", load_config)
+    monkeypatch.setattr(cli, "generate_many", generate_many)
+
+    exit_code = cli.main(
+        [
+            "gen-data",
+            "--seeds",
+            "2:5",
+            "--workers",
+            "2",
+            "--out",
+            "data/test",
+            "--set",
+            "sim.steps=2",
+        ]
+    )
+
+    assert exit_code == 0
+    load_config.assert_called_once_with(None, ["sim.steps=2"])
+    generate_many.assert_called_once_with([2, 3, 4], config.sim, "data/test", 2)
+
+
+@pytest.mark.parametrize("seeds", ["2", "2:", "3:3", "-1:2", "a:b"])
+def test_gen_data_rejects_invalid_seed_range(monkeypatch: pytest.MonkeyPatch, seeds: str) -> None:
+    monkeypatch.setattr(cli, "load_config", Mock(return_value=Config()))
+    generate_many = Mock()
+    monkeypatch.setattr(cli, "generate_many", generate_many)
+    with pytest.raises(ValueError, match="seeds"):
+        cli.main(["gen-data", "--seeds", seeds])
+    generate_many.assert_not_called()
+
+
+def test_viz_episode_arguments_and_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = Config()
+    load_config = Mock(return_value=config)
+    viz_episode = Mock(return_value={"overview": "runs/viz/overview.png"})
+    monkeypatch.setattr(cli, "load_config", load_config)
+    monkeypatch.setattr(cli, "viz_episode", viz_episode)
+
+    exit_code = cli.main(
+        [
+            "viz-episode",
+            "--episode",
+            "data/raw/ep_000002.npz",
+            "--out",
+            "runs/viz/test",
+            "--step",
+            "2",
+            "--drone-index",
+            "1",
+        ]
+    )
+
+    assert exit_code == 0
+    load_config.assert_called_once_with(None, [])
+    viz_episode.assert_called_once_with("data/raw/ep_000002.npz", "runs/viz/test", step=2, drone_index=1)

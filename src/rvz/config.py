@@ -10,6 +10,7 @@ import yaml
 
 # YAML 解析结果的递归类型，避免 Any。
 YamlValue = None | bool | int | float | str | list["YamlValue"] | dict[str, "YamlValue"]
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -18,10 +19,50 @@ class SimConfig:
 
     robot_res: int = 128  # 小车相机分辨率（正方形）
     drone_res: int = 128  # 无人机相机分辨率（正方形）
-    fovy_deg: float = 90.0  # 小车固定相机与自由相机统一 fovy（FR-SIM-8）
+    fovy_deg: float = 90.0  # 前后固定相机与自由相机的垂直 FOV
+    robot_side_fovy_deg: float = 120.0  # 左右侧方相机广角垂直 FOV
+    robot_side_down_deg: float = 15.0  # 左右侧方相机下倾角
     dt: float = 0.1  # 步长，秒（初值）
     steps: int = 40  # 每 episode 步数（初值，D1）
     n_drones: int = 3  # 每步无人机相机数 M（FR-SIM-6）
+    warehouse_min_size: float = 12.0
+    warehouse_max_size: float = 20.0
+    min_aisles: int = 3
+    max_aisles: int = 6
+    grid_resolution: float = 0.25
+    robot_radius: float = 0.35
+    robot_speed: float = 0.5  # 米/秒；路径按弧长匀速采样
+    drone_distance_min: float = 1.4
+    drone_distance_max: float = 2.2
+    drone_height_min: float = 0.3
+    drone_height_max: float = 1.5
+    drone_elevation_min_deg: float = -30.0
+    drone_elevation_max_deg: float = -15.0
+    max_resamples: int = 100
+
+    def __post_init__(self) -> None:
+        if self.robot_res <= 0 or self.drone_res <= 0 or self.steps <= 0 or self.n_drones <= 0:
+            raise ValueError("分辨率、步数和无人机数必须为正整数")
+        if not 0.0 < self.fovy_deg < 180.0 or self.dt <= 0.0:
+            raise ValueError("fovy_deg 必须在 (0, 180) 内，dt 必须为正")
+        if not 0.0 < self.robot_side_fovy_deg < 180.0:
+            raise ValueError("robot_side_fovy_deg 必须在 (0, 180) 内")
+        if not 0.0 <= self.robot_side_down_deg < 90.0:
+            raise ValueError("robot_side_down_deg 必须在 [0, 90) 内")
+        if not 0.0 < self.warehouse_min_size <= self.warehouse_max_size:
+            raise ValueError("仓库尺寸范围无效")
+        if not 3 <= self.min_aisles <= self.max_aisles <= 6:
+            raise ValueError("通道数范围必须满足 3 <= min_aisles <= max_aisles <= 6")
+        if self.grid_resolution <= 0.0 or self.robot_radius <= 0.0 or self.robot_speed <= 0.0:
+            raise ValueError("栅格分辨率、机器人半径和速度必须为正")
+        if not 0.0 < self.drone_distance_min <= self.drone_distance_max:
+            raise ValueError("无人机距离范围无效")
+        if not 0.0 < self.drone_height_min <= self.drone_height_max:
+            raise ValueError("无人机高度范围无效")
+        if not -90.0 < self.drone_elevation_min_deg <= self.drone_elevation_max_deg < 90.0:
+            raise ValueError("无人机俯仰角范围无效")
+        if self.max_resamples <= 0:
+            raise ValueError("max_resamples 必须为正整数")
 
 
 @dataclass(frozen=True)

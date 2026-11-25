@@ -1,6 +1,7 @@
 # Mac M1 Pro 调试配置（SPEC §8.1，D0）
 sim:
-  drone_res: 64
+  robot_res: 256
+  drone_res: 256
   steps: 30
 model:
   dim: 256

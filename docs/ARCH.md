@@ -49,6 +49,7 @@ reality-view-zero/
 │       ├── data/
 │       │   ├── __init__.py
 │       │   ├── schema.py        # 字段/形状常量、validate_episode
+│       │   ├── viz.py           # episode 接触表与位姿重投影检查图
 │       │   ├── features.py      # 编码器特征缓存（含 manifest）
 │       │   └── dataset.py       # torch Dataset、采样、Sample 结构
 │       ├── models/
@@ -69,6 +70,8 @@ reality-view-zero/
 │   ├── test_geometry.py
 │   ├── test_layout.py
 │   ├── test_schema.py
+│   ├── test_record.py
+│   ├── test_viz.py
 │   ├── test_rays.py
 │   ├── test_generator.py
 │   └── test_pipeline_tiny.py    # 端到端小集成
@@ -200,7 +203,7 @@ markers = ["slow: 耗时测试", "gpu: 需要 CUDA 或 MPS"]
 ```
  seed ──► sim.layout ──► sim.scene(MJCF) ──► sim.rig ──► sim.record
                                                             │
-                                    data/raw/ep_XXXXXX.npz  ▼   (schema v1)
+                                    data/raw/ep_XXXXXX.npz  ▼   (schema v2)
                                                  data.schema.validate_episode
                                                             │
                           models.encoder (冻结) ─► data/feats/{enc}_{res}/ep_XXXXXX.npy + manifest.json
@@ -242,10 +245,14 @@ def sync(device) -> None                    # 计时前后同步
 **`geometry.py`**（纯 numpy）
 ```python
 GL_TO_CV = np.diag([1, -1, -1, 1]).astype(np.float32)      # 唯一的约定转换点
+CAM_ORDER = ("front", "left", "right", "back")            # sim/data 共享，避免反向依赖
+SIDE_CAMERAS = ("left", "right")                         # 独立广角与下倾参数
+MARKER_LOCAL = (0.20, 0.0, 0.18)                          # 车体朝向标记的 Base 系位置
 def gl_cam_to_cv_pose(pos, forward, up) -> np.ndarray       # -> T_W_Ccv (4,4)
 def invert(T) -> np.ndarray
 def relative(T_W_a, T_W_b) -> np.ndarray                    # T_a_b
-def project(K, T_C_W, pts_W) -> np.ndarray                  # 重投影
+def intrinsics_from_fovy(fovy_deg, width, height) -> np.ndarray
+def project(K, T_C_W, pts_W) -> tuple[np.ndarray, np.ndarray]  # (uv, depth)
 def scale_K(K, sx, sy) -> np.ndarray
 ```
 
@@ -267,9 +274,9 @@ def plan_path(layout: Layout, rng) -> np.ndarray    # 栅格上的 A* 路径，(
 def layout_to_mjcf(layout: Layout, cfg: SimConfig) -> str   # 含 4 个小车固定相机
 
 # rig.py
-def robot_poses(path, n_steps, dt) -> np.ndarray             # (T,4,4) T_W_B
+def robot_poses(path, n_steps, dt, speed) -> np.ndarray       # (T,4,4) T_W_B，按弧长匀速采样
 def drone_trajectories(rng, layout, robot_poses, cfg) -> list[DroneTraj]
-def read_gl_camera(renderer) -> tuple[pos, forward, up]      # 从渲染后场景读出
+def read_gl_camera(renderer) -> tuple[pos, forward, up]      # 读取单目实际使用的双目平均相机
 
 # record.py
 def generate_episode(seed: int, cfg: SimConfig) -> dict[str, np.ndarray | str]
@@ -277,16 +284,21 @@ def generate_many(seeds, cfg, out_dir, workers: int) -> None   # 多进程，逐
 ```
 要点：
 - 小车每步：设位姿 → `mj_forward` → 渲染 4 路 → 对每台无人机设自由相机 → `update_scene` → 渲染 → 读出 GL 相机位姿 → `gl_cam_to_cv_pose`。
+- 小车前后相机使用 `fovy_deg`；左右相机使用 `robot_side_fovy_deg=120`、`robot_side_down_deg=15`，MJCF 中直接设置相机 XY 轴实现无滚转下倾，4 路内参分别写入 `K_robot`。
+- 无人机参数轨迹由 `rig` 生成为严格正后方的近低机位第三人称视角；`record` 先用射线计算机位前方的安全距离，通过双向限幅平滑缩短弹簧臂，再从单目实际使用的双目平均 GL 相机读取位姿；遮挡物通过 `mj_ray` 找出，仅在当前无人机画面用 geom group 隐藏，随后立即恢复模型分组；几何校验不通过时整段重采样。
 - 无人机相机位置检查（不在几何体内、小车在视野内）使用 `Layout` 里的几何体 AABB，不依赖物理引擎碰撞。
-- 重采样有最大次数，超出抛异常并在 `meta` 中记录。
+- 重采样有最大次数，超出抛异常；实际次数与发光标记重投影误差记录在 `meta` 中。
 
 ### 5.3 `data`
 
 ```python
-# schema.py
-SCHEMA_VERSION = 1
-CAM_ORDER = ("front", "left", "right", "back")
-def validate_episode(ep: Mapping[str, Any]) -> None     # 形状、dtype、旋转正交性
+# schema.py（SCHEMA_VERSION 由 config.py 定义并在此重导出，避免 sim 反向依赖 data）
+SCHEMA_VERSION = 2
+CAM_ORDER = ("front", "left", "right", "back")  # 从 geometry.py 重导出
+def validate_episode(ep: Mapping[str, np.ndarray | str]) -> None  # 形状、dtype、旋转正交性
+
+# viz.py
+def viz_episode(episode_path, out_dir, step=0, drone_index=0) -> dict[str, Path]
 
 # features.py
 def cache_features(raw_dir, out_dir, encoder, cfg) -> None   # 幂等；写 manifest.json
@@ -398,6 +410,8 @@ def build_report(results, out_dir) -> None           # report.json + 对比图
 | 单元 | `geometry`：GL→CV 转换、`relative`/`invert` 往返、重投影已知点 | 默认 |
 | 单元 | `layout`：随机 100 个 seed 全部有效；A* 路径不穿几何体 | 默认 |
 | 单元 | `schema`：好/坏 episode 的校验结果 | 默认 |
+| 集成 | `record`：tiny episode 确定性、真实 GL 重投影、可见性、禁止 `mj_step`、spawn 多进程 | 默认 |
+| 集成 | `viz`：上下文/无人机/重投影图片导出与下标校验 | 默认 |
 | 单元 | `rays`：torch 实现与 numpy 参考一致（容差 1e-5） | 默认 |
 | 单元 | `generator`：tiny 配置（CPU）前向/反向、形状、有限性 | 默认 |
 | 集成 | `test_pipeline_tiny`：生成 2 个 episode → 用**假编码器**缓存特征 → 跑 2 个训练步 → 采样 | 默认（不下载大文件） |
@@ -428,7 +442,7 @@ def build_report(results, out_dir) -> None           # report.json + 对比图
 
 ## 10. 扩展点
 
-- **换仿真器**：写一个适配器，输出符合 `schema v1` 的 npz 即可；下游不改。RoboCasa 需单独环境（要求特定 Python 版本和分支），只通过 npz 交换。
+- **换仿真器**：写一个适配器，输出符合 `schema v2` 的 npz 即可；下游不改。RoboCasa 需单独环境（要求特定 Python 版本和分支），只通过 npz 交换。
 - **换编码器**：`EncoderConfig.id` + `encoder.py` 里的注册表；特征缓存 manifest 自动区分。
 - **换生成器变体**：`Generator` 的构造参数（dim/depth/heads/patch/条件开关）；新变体放同一文件，不新增顶层模块。
 - **输出多帧小片段**（M8）：在 `Sample` 增加 `tgt_rgb_seq`，生成器输出 token 维度扩展；采样器接口不变。

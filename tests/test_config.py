@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from rvz.config import Config, load_config
+from rvz.config import Config, SimConfig, load_config
 
 
 def test_defaults_construct_without_file() -> None:
@@ -53,10 +53,22 @@ def test_config_is_frozen() -> None:
         cfg.sim.drone_res = 64  # type: ignore[misc]  # 故意验证 frozen 行为
 
 
+def test_invalid_sim_ranges_rejected() -> None:
+    with pytest.raises(ValueError, match="通道数范围"):
+        SimConfig(max_aisles=7)
+    with pytest.raises(ValueError, match="无人机距离范围"):
+        SimConfig(drone_distance_min=4.0, drone_distance_max=2.0)
+    with pytest.raises(ValueError, match="robot_side_fovy_deg"):
+        SimConfig(robot_side_fovy_deg=180.0)
+    with pytest.raises(ValueError, match="robot_side_down_deg"):
+        SimConfig(robot_side_down_deg=-1.0)
+
+
 def test_shipped_configs_load() -> None:
     root = Path(__file__).resolve().parents[1]
     mac = load_config(root / "configs" / "mac_debug.yaml")
-    assert mac.sim.drone_res == 64
+    assert mac.sim.robot_res == 256
+    assert mac.sim.drone_res == 256
     assert mac.model.dim == 256
     linux = load_config(root / "configs" / "linux_main.yaml")
     assert linux.sim.drone_res == 128
