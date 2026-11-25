@@ -35,7 +35,7 @@ reality-view-zero/
 ├── src/
 │   └── rvz/
 │       ├── __init__.py
-│       ├── cli.py               # 子命令入口（argparse）
+│       ├── cli.py               # 子命令入口（tyro）
 │       ├── config.py            # frozen dataclass 配置 + YAML 加载 + --set 覆盖
 │       ├── device.py            # 设备/精度/随机种子/同步
 │       ├── geometry.py          # 位姿、相机约定转换、重投影（纯 numpy）
@@ -102,6 +102,7 @@ dependencies = [
   "pillow",
   "pyyaml",
   "tqdm",
+  "tyro",
 ]
 
 [project.scripts]

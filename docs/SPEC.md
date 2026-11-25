@@ -264,7 +264,7 @@ batch=1；预热 10 次，测 50 次；计时前后做设备同步；报告 1/2/
 
 ## 10. 非功能需求
 - **确定性**：给定 `(seed, 代码版本)`，数据生成可复现；训练固定随机种子并在 `meta` 中记录。
-- **最小依赖**：运行依赖仅 `numpy, mujoco, torch, torchvision, transformers, peft, lpips, einops, pillow, pyyaml, tqdm`；开发依赖仅 `pytest, ruff`。新增依赖需先在 §12 记录理由。
+- **最小依赖**：运行依赖仅 `numpy, mujoco, torch, torchvision, transformers, peft, lpips, einops, pillow, pyyaml, tqdm, tyro`；开发依赖仅 `pytest, ruff`。新增依赖需先在 §12 记录理由。
 - **可测试**：`pytest -m "not slow and not gpu"` 在 Mac CPU 上跑完，且不下载任何大文件。
 - **日志**：库代码用 `logging`，不用 `print`。
 - **文件体量**：单文件尽量不超过约 400 行；超出先考虑拆分。
@@ -316,6 +316,7 @@ batch=1；预热 10 次，测 50 次；计时前后做设备同步；报告 1/2/
 | 2026-11-25 | M0；§4 FR-SIM-9；§8；§12.2；ARCH §5.1 | M0 交付：uv 骨架、`config`/`device`/`doctor`/`cli`、双平台配置与测试；G0（darwin）通过；记录 MuJoCo elevation 符号约定、MPS JVP 可用、MPS bf16 可运行（fp32 策略不变）等实测结论 | 环境与可行性验证 |
 | 2026-11-25 | §12.2-7；`doctor` | 真实 DINOv3-B 权重与 HF 协议验证推迟到 M2；M0 改用本地随机初始化小 DINOv3-ViT 离线验证架构支持与前向 | 模型体积大且本机代理网络受限，M0 不需要真实权重 |
 | 2026-11-25 | pyproject；ARCH §2.1 | 默认 PyPI 索引与 `pytorch-cu128` 索引均改为南京大学镜像（`mirrors.nju.edu.cn/pypi/web/simple`、`mirrors.nju.edu.cn/pytorch/whl/cu128`） | 国内网络环境下提升解析与下载速度 |
+| 2026-11-25 | §9、§10；ARCH §2、§2.1 | CLI 从 `argparse` 迁移到 `tyro`，新增 `tyro` 运行依赖；保留现有子命令、参数与退出码 | 用类型标注生成参数解析，减少手工解析与调度样板 |
 
 ### 12.2 M0 必须解决的未决问题（均对应 `doctor` 检查项）
 

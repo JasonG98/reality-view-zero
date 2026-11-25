@@ -19,6 +19,7 @@ dependencies = [
   "pillow",
   "pyyaml",
   "tqdm",
+  "tyro>=1.0.17",
 ]
 
 [project.scripts]
