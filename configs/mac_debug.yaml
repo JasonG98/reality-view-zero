@@ -1,0 +1,10 @@
+# Mac M1 Pro 调试配置（SPEC §8.1，D0）
+sim:
+  drone_res: 64
+  steps: 30
+model:
+  dim: 256
+  depth: 4
+  heads: 4
+train:
+  batch: 16

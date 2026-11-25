@@ -1,0 +1,11 @@
+# Linux + RTX 5060 Ti 16G 主线配置（SPEC §8.1，D1；与 dataclass 默认值一致，显式列出便于查阅）
+sim:
+  robot_res: 128
+  drone_res: 128
+  steps: 40
+model:
+  dim: 512
+  depth: 12
+  heads: 8
+train:
+  batch: 32

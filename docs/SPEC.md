@@ -1,0 +1,349 @@
+# SPEC.md — reality-view-zero 项目规格
+
+> 状态：v1（初稿）　项目名：`reality-view-zero`　包名：`rvz`　Python ≥ 3.11、< 3.16　布局：uv + src-layout
+> 阅读顺序：**SPEC.md（做什么）→ ARCH.md（怎么组织）→ AGENTS.md（怎么协作）**
+> 标注约定：「（初值）」= 起始取值，首次实测后允许修订并记入 §12；「（未核实）」= 凭已有知识写的，必须在 M0 验证。
+
+---
+
+## 1. 目的与范围
+
+### 1.1 一句话
+在 MuJoCo 仿真里，用**小车 4 路相机的帧序列 + 无人机相机位姿**，端到端（像素进、像素出）生成**无人机视角画面**；特征提取器为冻结的预训练模型，生成器为像素空间的 MeanFlow。
+
+这是对 Tesla Reality View 公开描述的**低成本复刻验证**：冻结编码器特征 → 小型扩散/流模型 → 上一步输出加噪后去噪 → 少步生成。Tesla 的训练目标与数据来源未公开，本项目的对应关系是推断。
+
+### 1.2 目标
+1. 在仿真中证明"多视角特征 + 位姿条件 → 新视角像素"这条端到端管线能跑通、能收敛。
+2. 验证时间递归（上一步输出加噪作条件）能抑制漂移。
+3. 验证像素空间 MeanFlow 能把采样压到 1–4 步，并在两台机器上测出延迟。
+4. 验证冻结编码器上叠加 LoRA 的自监督/端到端微调是否带来稳定提升。
+
+### 1.3 非目标
+- 不做显式 3D 表示（3DGS、占据栅格、点云）。
+- 不做真实数据（nuScenes 等）与真机部署。
+- 不做物理仿真（小车只做运动学）。
+- 不追求画质上限；追求**管线正确、指标可比较、双平台可复现**。
+- 不实现 Tesla 的 4 周期分摊、层间交错更新（记为后续工作）。
+
+---
+
+## 2. 约定（所有模块必须遵守）
+
+### 2.1 单位与类型
+- 长度：米；时间：秒；内部角度：弧度（仅在配置文件边界使用度）。
+- 位姿一律用 **4×4 float32 矩阵**，不存四元数（避免顺序歧义）。
+- 命名：`T_a_b` 表示把 b 系下的点变换到 a 系（a←b），即 `p_a = T_a_b @ p_b`。
+
+### 2.2 坐标系
+| 名称 | 定义 |
+|---|---|
+| World `W` | MuJoCo 世界系，z 向上 |
+| Base `B` | 小车系：x 前、y 左、z 上；原点为车体中心 |
+| Camera `C` | **OpenCV 约定**：x 右、y 下、z 前（光轴） |
+
+- **MuJoCo 的 GL 相机**前向为 −Z、上为 +Y。转 OpenCV：`T_W_Ccv = T_W_Cgl @ diag(1, −1, −1, 1)`。这个转换只允许出现在 `geometry.py` 中一处。
+- 小车 4 相机固定顺序：`front, left, right, back`；相对 B 的偏航角分别为 `0°, +90°, −90°, 180°`（绕 z，逆时针为正）。
+- 内参 `K`（3×3，像素单位）。图像缩放后 `K` 必须同步缩放。
+
+### 2.3 时间与采样
+- 一个 episode 有 `T` 步，步长 `Δt`；步下标 `t = 0..T−1`。
+- 训练样本为 `(episode, t, m)`：`t ≥ 1`（需要 `t−1` 作上下文和递归条件），`m` 为无人机相机下标。
+- 上下文步集合固定为 `{t, t−1}`。
+
+### 2.4 图像与张量
+- 存储：uint8，HWC。
+- 生成器输入输出：float32，CHW，范围 `[−1, 1]`。
+- 编码器输入：按所选预训练模型的归一化（均值/方差）处理；写入特征缓存 manifest。
+
+### 2.5 射线嵌入（Plücker）
+对目标相机（无人机）和每个上下文相机的每个 patch 中心像素 `(u, v)`：
+```
+d_C = normalize(K^-1 [u, v, 1]^T)
+d_B = R_B_C d_C ，  o_B = t_B_C
+plucker = [d_B, o_B × d_B]   # 6 维
+```
+- 所有射线统一表示在**目标时刻 `t` 的 Base 系**里；上下文步 `t−1` 的相机位姿通过世界位姿换算到 `t` 的 Base 系，以补偿小车运动。
+- 必须有 numpy 参考实现，torch 实现与其数值一致（测试覆盖）。
+
+---
+
+## 3. 数据规格
+
+### 3.1 Episode 文件
+路径：`data/raw/ep_{seed:06d}.npz`。字段（`T` 步，`H/W` 为小车图像分辨率，`Hd/Wd` 为无人机图像分辨率，`M` 为无人机数）：
+
+| 字段 | 形状 | 类型 | 含义 |
+|---|---|---|---|
+| `robot_rgb` | `[T, 4, H, W, 3]` | uint8 | 小车 4 路图像，顺序 front/left/right/back |
+| `T_W_B` | `[T, 4, 4]` | float32 | 每步小车位姿（World←Base） |
+| `T_B_Crobot` | `[4, 4, 4]` | float32 | 4 路小车相机相对 Base 的固定外参（OpenCV 约定） |
+| `K_robot` | `[3, 3]` | float32 | 小车相机内参 |
+| `drone_rgb` | `[T, M, Hd, Wd, 3]` | uint8 | 无人机图像 |
+| `T_W_Cdrone` | `[T, M, 4, 4]` | float32 | 无人机相机世界位姿（OpenCV 约定），**由渲染后的场景相机读出** |
+| `K_drone` | `[3, 3]` | float32 | 无人机内参 |
+| `meta_json` | 标量字符串 | str | seed、布局参数、`dt`、`fovy`、MuJoCo 版本、平台、git hash、schema 版本 |
+
+- 只存世界位姿；Base 系下的相对位姿在加载时计算。
+- `schema_version` 写在 `meta_json` 里；**改字段必须升版本号**。
+- 校验器 `data.schema.validate_episode` 必须检查形状、dtype、旋转矩阵正交性（容差 1e-4）、位姿最后一行为 `[0,0,0,1]`。
+
+### 3.2 划分
+布局是 seed 的确定性函数，所以按 seed 划分就是按布局划分：
+
+| 划分 | seed 范围（初值） |
+|---|---|
+| train | 0–9999 |
+| val | 10000–10099 |
+| test | 20000–20099 |
+
+### 3.3 数据集规模（初值，估计）
+| 名称 | 规模 | 用途 |
+|---|---|---|
+| D0 | train 20 episode × 30 步；val 4 episode | Mac 调试 |
+| D1 | train 300 episode × 40 步；val 30 episode | 主线首轮（Linux 生成） |
+| D2 | train 2,000 episode × 50 步；val 100 episode | 扩大版 |
+
+### 3.4 特征缓存
+路径：`data/feats/{encoder_id}_{res}/ep_{seed:06d}.npy`，fp16，形状 `[T, 4, N, C]`（`N=(res/16)²`，`C=768`）。
+同目录 `manifest.json` 记录：编码器 id 与 revision、输入分辨率、归一化参数、`rvz` 版本。manifest 不匹配时必须拒绝加载。
+
+---
+
+## 4. 仿真规格（`rvz.sim`）
+
+| 编号 | 需求 |
+|---|---|
+| FR-SIM-1 | 给定 `seed` 与 `SimConfig`，**确定性**生成仓库式布局：矩形，边长 12–20 m（初值），**无天花板**；3–6 条通道；货架行（box 几何体）+ 随机堆叠箱子；托盘；散落障碍与少量干扰物 |
+| FR-SIM-2 | 随机化：墙/地面纹理与颜色、货架/箱子颜色、1–3 盏灯、天空/背景 |
+| FR-SIM-3 | 布局同时产出 2D 空闲栅格；小车路径在栅格上随机选点 + A*，无碰撞，匀速 |
+| FR-SIM-4 | 小车为**运动学刚体**，不调用 `mj_step`：每步直接设位姿，调用 `mj_forward` 后渲染。车体带不对称标记，保证无人机画面里能看出朝向 |
+| FR-SIM-5 | 小车 4 路固定相机（挂车体，FOV 90°，高约 0.3 m）；无人机为 **MuJoCo 自由相机**（看向点、距离、方位角、俯仰角），每步每台更新 |
+| FR-SIM-6 | 每步 `M=3` 台无人机相机，各自独立平滑轨迹：方位角 `ψ(t)=ψ0+ωt`（`ω` 约 ±10–40°/s，初值），距离 2–4 m、离地 2.5–5 m（初值），看向小车加小抖动 |
+| FR-SIM-7 | 无人机相机位置**不得在任何几何体内**，且小车必须在其视野内（含朝向标记）；违反则重采样 |
+| FR-SIM-8 | 相机内参统一：`model.vis.global.fovy` 与小车相机 `fovy` 设为同一值；确保离屏缓冲尺寸不小于渲染尺寸 |
+| FR-SIM-9 | 位姿从渲染后场景里的 GL 相机（位置、前向、上向量）读出，再转 OpenCV 约定；**禁止手写方位角/俯仰角公式**。注意 MuJoCo `mjvCamera.elevation` 的符号约定：**负值 = 相机在上方俯视**（M0 实测确认） |
+| FR-SIM-10 | 多进程并行生成，每进程独立渲染器；Linux 使用 `MUJOCO_GL=egl`，Mac 用默认后端 |
+| FR-SIM-11 | `rvz.sim` **不得导入 torch** |
+
+---
+
+## 5. 模型规格
+
+### 5.1 特征提取器（FR-MOD-1）
+- 默认：冻结 **DINOv3-B（patch 16）**；HF 模型 id 放配置，不写死（未核实：需在 Hugging Face 同意协议）。
+- 输入分辨率可配：默认 128（8×8=64 token/相机），后期可试 224（14×14=196）。
+- 输出 patch token `[B, N, 768]`；可选 2×2 平均池化。
+- 冻结模式：`no_grad`，使用特征缓存。LoRA 模式：在线编码（不使用缓存），仅 LoRA 参数可训。
+
+### 5.2 生成器（FR-MOD-2）
+- DiT 风格 Transformer，**像素空间，不用潜空间/解码器**；目标分辨率 `Hd×Wd`（默认 128，Mac 64），patch 8。
+- 输入：带噪图像 patch token、时间嵌入（flow matching 用 `t`，MeanFlow 用 `(r, t)`）、上下文 token、射线嵌入、递归条件 token。
+- 上下文 token：4 相机 × 步 `{t, t−1}`，每个 token = 投影后的特征 + 该 patch 的 Plücker 嵌入 + 相机/时间嵌入。
+- 注入方式：目标 token 对上下文 token 做 cross-attention；时间步用 AdaLN。
+- **输出为去噪后的图像 x̂（x-prediction）。不得直接预测像素空间的速度场**（pMF 论文指出会严重失败）。
+- 参数量：Linux 主线约 30–40M，Mac 调试约 3–5M（均为估计）。
+
+### 5.3 条件（FR-MOD-3）
+- **射线嵌入**：见 §2.5，目标（无人机）与每个上下文 token 都带。
+- **时间递归**：上一步无人机输出（同一台无人机相机的 `t−1` 图像）加噪后作为额外条件 token。训练时用真值加噪（噪声强度随机采样），推理时用自己上一步的输出；首步不带该条件。
+- **相机丢弃**：训练时以概率 `p_drop`（初值 0.15）随机丢弃部分小车相机的上下文 token。
+
+### 5.4 采样（FR-MOD-4）
+- flow matching：Euler，步数可配（默认 50）。
+- MeanFlow：少步（1/2/4），按平均速度场迭代。
+- 采样器与具体训练目标解耦，对外只暴露 `sample(generator, cond, steps)`。
+
+---
+
+## 6. 训练规格
+
+### 6.1 阶段
+| 阶段 `--stage` | 内容 | 损失（默认） |
+|---|---|---|
+| `regress` | 无生成模型，直接回归无人机图像；作为下限基线 | MSE + LPIPS |
+| `fm` | flow matching + x-prediction，多步采样 | x 空间 MSE + λ·LPIPS |
+| `fm_rec` | 在 `fm` 上加入时间递归条件与噪声增强 | 同上 |
+| `meanflow` | pMF（或 Euler Mean Flows）训练，1–4 步生成 | 见 §6.2 |
+| `lora` | 冻结编码器 → LoRA 微调（编码器 + 生成器联合） | 同 `meanflow` 或 `fm_rec`，加可选辅助损失 |
+
+### 6.2 MeanFlow 变体（`meanflow_variant`）
+| 值 | 说明 |
+|---|---|
+| `pmf` | pixel MeanFlow（arXiv:2601.22158）：x-prediction + MeanFlow 损失 + 感知损失；需要 JVP |
+| `emf` | Euler Mean Flows（arXiv:2602.02571）：不需要 JVP，含像素空间 x₁-prediction 变体 |
+- JVP 与 PyTorch 原生 Flash Attention 不兼容；JVP 路径需走数学注意力。
+- Mac 上 JVP 是否可用**未核实**（M0 检查）；不可用则 Mac 只跑 `fm`/`fm_rec`，或改用 `emf`。
+
+### 6.3 LoRA 与自监督辅助损失（`lora` 阶段）
+- 仿真中无人机画面是免费真值，整套训练无需人工标注。
+- LoRA 微调 DINOv3（`peft`），学习率低于生成器；保留冻结版作对照。
+- 可选辅助损失 `aux_cross_cam`：丢掉一路小车相机，用其余相机预测该相机的（冻结教师）特征。
+- 若验证集无稳定提升，**保留冻结版为最终结果**。
+
+### 6.4 通用要求（FR-TRN）
+- FR-TRN-1：设备无关（见 §8）；`--overfit-episode <seed>` 模式：只用一个 episode 训练。
+- FR-TRN-2：支持 resume；checkpoint 含权重、配置快照、git hash、库版本。
+- FR-TRN-3：可选 EMA（初值 0.999），评估默认用 EMA 权重。
+- FR-TRN-4：日志写 `runs/<name>/log.jsonl`；默认不依赖外部实验跟踪服务。
+
+---
+
+## 7. 评估规格（`rvz.evaluate`）
+
+### 7.1 指标（对无人机图像真值，在 `[0,1]` 范围计算）
+- **LPIPS**（主指标）、**PSNR**、**SSIM**（Gaussian 11×11，σ=1.5，RGB 通道均值）。
+- D1 规模不报 FID/KID。
+
+### 7.2 基线
+| 名称 | 定义 |
+|---|---|
+| `regress` | §6.1 回归基线 |
+| `copy_nearest_cam` | 选光轴与无人机光轴夹角最小的小车相机，缩放到无人机分辨率后直接输出 |
+| 消融 | 去位姿条件 / 去时间上下文 / 去递归 / 去 camera dropout / 冻结 vs LoRA |
+
+### 7.3 分桶
+按无人机距离、高度、相对小车的方位角（前/左/后/右四象限）分桶，分别报告。
+
+### 7.4 递归漂移
+对同一无人机轨迹滚动推理 `K=10` 步，报告各步 LPIPS 曲线。
+
+### 7.5 延迟（FR-EVL）
+batch=1；预热 10 次，测 50 次；计时前后做设备同步；报告 1/2/4/50 步的均值±标准差；CUDA 额外报告峰值显存。**每台机器单独报告**。
+
+### 7.6 产物
+`runs/<name>/report.json` + 对比图（上下文 4 图 | 预测 | 真值 | 差异）。
+
+---
+
+## 8. 平台与性能需求
+
+| 项 | Linux + RTX 5060 Ti 16G | Mac M1 Pro |
+|---|---|---|
+| 角色 | 最终数据集生成、特征缓存、全部训练 | 开发调试、D0、`fm`/`fm_rec`、推理与可视化 |
+| MuJoCo 渲染 | EGL（需 NVIDIA EGL/GLVND 用户态库） | 默认后端（cgl）；交互窗口才需 `mjpython` |
+| 精度 | bf16 autocast | **fp32**（M0 实测 MPS bf16 matmul 可运行；fp32 为既定策略，不变） |
+| PyTorch | **CUDA 12.8+ 构建**（Blackwell sm_120 需要 PyTorch ≥ 2.7） | MPS；最新版要求 macOS 15+、Python 3.11+ |
+| 注意力 | `scaled_dot_product_attention` | 同左；不依赖 flash-attn/xformers |
+| `torch.compile` | 可选 | **不使用** |
+
+- **Python 版本**：PyPI 上 MuJoCo 4.0.1 与 `mujoco-core` 4.0.1 的元数据声明支持 Python 3.11–3.15；`mujoco-core` 已为 macOS arm64 和 Linux x86_64 提供 CPython 3.15 wheel。项目配置限制为 `>=3.11,<3.16`。M0 实测（darwin arm64）：Python 3.11.15 + MuJoCo 4.0.1 + torch 2.15.0 + transformers 5.24.1 安装运行通过，`uv.lock` 双平台解析成功；Linux 侧安装待运行。
+- 同一场景同一位姿在两个平台渲染的像素可能略有差异。**最终训练/评估数据只在 Linux 生成**；Mac 的 D0 仅用于调试，不与最终数据混用。
+- 配置按机器分两份（`configs/mac_debug.yaml`、`configs/linux_main.yaml`）；差异只允许出现在配置里，不允许出现在代码分支里。
+
+### 8.1 配置差异（初值，估计）
+| 项 | `mac_debug` | `linux_main` |
+|---|---|---|
+| 小车相机分辨率 | 128 | 128 → 224 |
+| 无人机分辨率 | 64 | 128 |
+| 生成器 dim/depth/heads | 约 256/4/4（3–5M） | 512/12/8（30–40M） |
+| batch | 8–16 | 32–64 |
+| 精度 | fp32 | bf16 |
+| 数据 | D0 | D1 → D2 |
+
+---
+
+## 9. 命令行（FR-CLI）
+
+入口：`rvz <子命令>`（`uv run rvz ...`）。
+
+| 子命令 | 作用 |
+|---|---|
+| `doctor` | M0 可行性检查，输出 ✅/❌ 表，写 `runs/doctor_<platform>.json` |
+| `gen-data` | 生成 episode（`--seeds a:b --workers N --out data/raw`） |
+| `viz-episode` | 把一个 episode 导出为图片/视频，并画出位姿重投影检查图 |
+| `cache-feats` | 缓存编码器特征（幂等，manifest 校验） |
+| `train` | 训练（`--stage`、`--run`、`--resume`、`--overfit-episode`） |
+| `sample` | 用 checkpoint 对指定 episode 采样并保存图片 |
+| `eval` | 评估（`--steps 1,2,4,50`），输出 `report.json` |
+| `bench` | 延迟与显存测试 |
+
+所有子命令统一接收 `--config`，并支持 `--set a.b.c=value` 覆盖配置。
+
+---
+
+## 10. 非功能需求
+- **确定性**：给定 `(seed, 代码版本)`，数据生成可复现；训练固定随机种子并在 `meta` 中记录。
+- **最小依赖**：运行依赖仅 `numpy, mujoco, torch, torchvision, transformers, peft, lpips, einops, pillow, pyyaml, tqdm`；开发依赖仅 `pytest, ruff`。新增依赖需先在 §12 记录理由。
+- **可测试**：`pytest -m "not slow and not gpu"` 在 Mac CPU 上跑完，且不下载任何大文件。
+- **日志**：库代码用 `logging`，不用 `print`。
+- **文件体量**：单文件尽量不超过约 400 行；超出先考虑拆分。
+
+---
+
+## 11. 验收门槛与里程碑
+
+验收阈值均为**初值**，首次实测后可修订，修订需记入 §12，**不得静默改动**。
+
+### 11.1 门槛
+| 门槛 | 通过条件 |
+|---|---|
+| **G0** | `doctor` 在两台机器上全部 ✅，或每个 ❌ 项有记录在案的替代方案 |
+| **G1** | 随机 100 个 seed 的布局全部有效（无重叠/悬空、栅格正确、路径无碰撞）；位姿重投影误差 ≤ 2 像素；无人机相机无穿模且小车在视野内；`validate_episode` 全通过；Linux 吞吐已记录；画面门槛：人眼判断像仓库且纹理多样 |
+| **G2** | 特征缓存可重复生成；`regress` 与 `copy_nearest_cam` 基线能在 val 上算出全部指标 |
+| **G3** | ① 单 episode 过拟合：train LPIPS ≤ 0.10（初值）；② 未见布局（val）上 LPIPS 优于 `regress` 与 `copy_nearest_cam` |
+| **G4** | 10 步滚动推理的 LPIPS 漂移：第 10 步 ≤ 1.3 × 第 1 步（初值）；且优于无递归版本 |
+| **G5** | 4 步 MeanFlow 的 val LPIPS 与 `fm` 50 步相比，退化 ≤ 10%（相对，初值）；两台机器延迟已记录 |
+| **G6** | LoRA 版 val LPIPS 相对冻结版提升 ≥ 3%（相对，初值）；否则冻结版为最终结果 |
+| **G7** | 完整对比表 + 分桶报告 + 漂移曲线 + 延迟表 + 定性图齐全 |
+
+**最重要的体检是 G3① 单 episode 过拟合**：过不了说明管线有 bug（位姿约定、归一化、条件注入），不得进入后续里程碑。
+
+### 11.2 里程碑（不含时间，按依赖顺序）
+
+| 里程碑 | 交付物 | 退出条件 | 依赖 |
+|---|---|---|---|
+| **M0 环境与可行性** | `pyproject.toml`（uv，平台标记的 torch 源）、`config.py`、`device.py`、`doctor.py` | G0；§12.2 的未决问题逐项有结论 | — |
+| **M1 仿真与数据管线** | `geometry.py`、`sim/*`、`data/schema.py`、`gen-data`、`viz-episode`、对应测试 | G1 | M0 |
+| **M2 特征缓存与基线** | `models/encoder.py`、`data/features.py`、`data/dataset.py`、`cache-feats`、`regress` 阶段、`evaluate/metrics.py` 与基线 | G2 | M1 |
+| **M3 flow matching** | `models/rays.py`、`models/generator.py`、`models/sampler.py`、`train/*`（`fm`）、`sample` | G3 | M2 |
+| **M4 时间递归** | `fm_rec` 阶段、滚动推理、漂移评估 | G4 | M3 |
+| **M5 MeanFlow** | `meanflow` 阶段（`pmf`/`emf`）、少步采样、`bench` | G5 | M4 |
+| **M6 自监督微调** | `lora` 阶段、`aux_cross_cam`、冻结 vs LoRA 对照 | G6 | M5 |
+| **M7 评估与报告** | `eval` 全功能、分桶、报告与图 | G7 | M6 |
+| **M8（可选扩展）** | RoboCasa 适配器（独立环境，输出同 schema）、224 分辨率、2–4 帧小片段输出、Self-Forcing 式滚动训练 | 各自单独立项 | M7 |
+
+---
+
+## 12. 变更记录与未决问题
+
+### 12.1 变更记录
+| 日期 | 章节 | 变更 | 原因 |
+|---|---|---|---|
+| 2026-11-25 | 全文 | 初稿 | — |
+| 2026-11-25 | 全文、§9 | 项目更名为 `reality-view-zero`，Python 包与 CLI 更名为 `rvz` | 统一项目命名 |
+| 2026-11-25 | §8；ARCH §2.1 | Python 范围改为 `>=3.11,<3.16`；补充 `uv_build`、Ruff 与 pytest 配置 | 依据 MuJoCo PyPI 元数据并统一工程检查 |
+| 2026-11-25 | M0；§4 FR-SIM-9；§8；§12.2；ARCH §5.1 | M0 交付：uv 骨架、`config`/`device`/`doctor`/`cli`、双平台配置与测试；G0（darwin）通过；记录 MuJoCo elevation 符号约定、MPS JVP 可用、MPS bf16 可运行（fp32 策略不变）等实测结论 | 环境与可行性验证 |
+| 2026-11-25 | §12.2-7；`doctor` | 真实 DINOv3-B 权重与 HF 协议验证推迟到 M2；M0 改用本地随机初始化小 DINOv3-ViT 离线验证架构支持与前向 | 模型体积大且本机代理网络受限，M0 不需要真实权重 |
+| 2026-11-25 | pyproject；ARCH §2.1 | 默认 PyPI 索引与 `pytorch-cu128` 索引均改为南京大学镜像（`mirrors.nju.edu.cn/pypi/web/simple`、`mirrors.nju.edu.cn/pytorch/whl/cu128`） | 国内网络环境下提升解析与下载速度 |
+
+### 12.2 M0 必须解决的未决问题（均对应 `doctor` 检查项）
+
+> 结论标注：「✅ darwin」= 2026-11-25 在 Mac M1 Pro（macOS 26，arm64）实测通过，数据见 `runs/gates/G0_darwin.json`；「待运行」= 尚未在该平台执行，不得视为已验证。Linux 统一复核命令：`uv sync && uv run rvz doctor --download`。
+
+1. MuJoCo 离屏渲染在 Mac（cgl）与 Linux（EGL）上能否各出一张图。
+   → ✅ darwin：固定相机与自由相机均出图，像素统计正常。Linux（EGL）：待运行。
+2. 自由相机方位角扫 0–360° 无花屏；位姿读出与重投影误差 ≤ 2 像素。
+   → ✅ darwin：24 个视角（12 方位 × 2 俯仰）无花屏，最大重投影误差 **0.885 像素**（GL 约定闭环，与官方 `compute_camera_matrix` 公式一致）。附带发现：`mjvCamera.elevation` **负值 = 俯视**（已记入 FR-SIM-9）。Linux：待运行。
+3. 小车固定相机与自由相机内参一致；离屏缓冲尺寸足够。
+   → ✅ darwin：`fovy` 均为 90°；离屏缓冲 640×480 ≥ 128×128。Linux：待运行。
+4. 128×128 渲染吞吐（单进程 / 多进程，两台机器）。
+   → ✅ darwin：单进程 **约 517 fps**（50 帧，含 `update_scene`）；spawn 2 worker 各约 88–92 fps。Linux：待运行。
+5. 多进程渲染在两个平台上都稳定。
+   → ✅ darwin：spawn 2 worker × 10 帧正常出图。Linux：待运行。
+6. 同一场景同一位姿跨平台像素差异的量级。
+   → 待运行：本机参考已写 `runs/doctor_assets/ref_darwin.npz`，Linux 运行 `rvz doctor` 后自动对比并报告量级。
+7. DINOv3-B 前向在 MPS 与 CUDA 上可用；`transformers` 版本支持；HF 协议已同意。
+   → 部分验证 ✅ darwin：transformers 5.24.1 提供 `DINOv3ViTModel`/`DINOv3ViTConfig`；本地随机初始化小 DINOv3-ViT（2 层，hidden 64）MPS 前向正常，tokens shape=(1,7,64)（cls + 2 register + 4 patch）。**真实 DINOv3-B 权重与 HF 协议验证推迟到 M2**（模型体积大；另实测发现本机 SOCKS 代理缺 `socksio` 会阻断 transformers 下载，届时走 http 代理或在本机环境补 `socksio`，不列入项目依赖）。CUDA 侧：随 M2 在 Linux 验证。
+8. 5060 Ti 上 PyTorch CUDA 算子可运行（无 `no kernel image` 错误）。
+   → 待运行：本机无 CUDA。Linux 需确认 torch 为 `+cu128` 构建（锁文件已含 cu128 索引条目）。
+9. MPS 上 `torch.func.jvp` 是否可用。
+   → ✅ **可用**：MPS 上 jvp 与中心差分最大偏差 6.86e-04（fp32）。`pmf` 变体在 Mac 上不被 JVP 否决；`emf` 仍保留为备选（ADR-4）。
+10. 数据文件在两台机器间可无痛拷贝并读取。
+    → ✅ darwin：npz 压缩写入/读回一致（uint8/float32/字符串）。跨机实际拷贝：待 Linux 复核。
+11. `uv sync` 在两个平台上都能解析并安装锁定的依赖。
+    → ✅ darwin：Python 3.11.15，torch 2.15.0、MuJoCo 4.0.1、transformers 5.24.1；`uv.lock` 含 darwin arm64 与 linux x86_64 双平台解析。Linux 安装：待运行。
+12. `lpips` 首次使用会下载权重：确认两台机器的下载与缓存路径。
+    → ✅ darwin：VGG 骨干下载与前向验证通过，缓存目录 `~/.cache/torch/hub/checkpoints`；已缓存时 `rvz doctor` 离线复验，未缓存需 `--download`。Linux：待运行。
+
+附加项（§8 未核实）：✅ darwin：`mps_bf16` 检查实测 **MPS bf16 matmul 可运行**（原"不支持"假设不成立）；MPS/CPU 训练策略保持 fp32 不变。

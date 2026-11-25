@@ -1,0 +1,78 @@
+[project]
+name = "reality-view-zero"
+version = "0.1.0"
+description = "Multi-view robot cameras -> drone-view generation (pixel-space MeanFlow) in MuJoCo"
+readme = "README.md"
+authors = [
+    { name = "guoguoguo", email = "1010906762@qq.com" }
+]
+requires-python = ">=3.11,<3.16"
+dependencies = [
+  "numpy",
+  "mujoco",
+  "torch>=2.7",
+  "torchvision",
+  "transformers",
+  "peft",
+  "lpips",
+  "einops",
+  "pillow",
+  "pyyaml",
+  "tqdm",
+]
+
+[project.scripts]
+rvz = "rvz.cli:main"
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[build-system]
+requires = ["uv_build>=0.13.10,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# 发布名与导入包名不同，显式指定 src/rvz。
+module-name = "rvz"
+
+# 默认 PyPI 与 PyTorch 均走南京大学镜像；macOS 的 torch 用默认索引（带 MPS 的 arm64 轮子）
+[[tool.uv.index]]
+name = "nju-pypi"
+url = "https://mirrors.nju.edu.cn/pypi/web/simple"
+default = true
+
+# Linux 走 CUDA 12.8 的 PyTorch 构建（Blackwell sm_120 需要）
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://mirrors.nju.edu.cn/pytorch/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+# 让 uv.lock 同时覆盖两个目标平台
+[tool.uv]
+required-environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = ["data", "runs"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
+# 中文文档与输出使用全角标点，关闭 RUF001–003 的同形字歧义检查。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = ["slow: 耗时测试", "gpu: 需要 CUDA 或 MPS"]

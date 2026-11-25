@@ -1,0 +1,43 @@
+# Python 生成物
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# 虚拟环境
+.venv/
+venv/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 数据与运行产物（SPEC §9：一律不提交）
+/data/
+/runs/
+
+# 模型权重（防呆：权重只放 runs/ 或缓存目录，不进版本库）
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# 环境与密钥（令牌只经环境变量，AGENTS §9）
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+
+# 日志与临时文件
+*.log
+*.tmp
+
+# 系统文件
+.DS_Store
