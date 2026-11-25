@@ -10,7 +10,7 @@ from rvz.sim.rig import robot_poses
 def test_100_seeds_have_valid_layouts_and_collision_free_paths() -> None:
     cfg = SimConfig()
     for seed in range(100):
-        layout = sample_layout(seed, cfg)
+        layout, _ = sample_layout(seed, cfg)
         validate_layout(layout)
         path = plan_path(layout, np.random.default_rng(seed + 10_000))
         assert path.ndim == 2 and path.shape[1] == 2
@@ -19,12 +19,15 @@ def test_100_seeds_have_valid_layouts_and_collision_free_paths() -> None:
 
 
 def test_layout_is_deterministic() -> None:
-    first = sample_layout(7, SimConfig())
-    second = sample_layout(7, SimConfig())
+    first, first_colors = sample_layout(7, SimConfig())
+    second, second_colors = sample_layout(7, SimConfig())
     assert first.width == second.width
     assert first.depth == second.depth
     assert len(first.boxes) == len(second.boxes)
     np.testing.assert_array_equal(first.occupied, second.occupied)
+    np.testing.assert_array_equal(first_colors.floor, second_colors.floor)
+    np.testing.assert_array_equal(first_colors.wall, second_colors.wall)
+    np.testing.assert_array_equal(first_colors.sky, second_colors.sky)
     for first_box, second_box in zip(first.boxes, second.boxes, strict=True):
         assert first_box.name == second_box.name
         np.testing.assert_array_equal(first_box.center, second_box.center)
@@ -34,7 +37,7 @@ def test_layout_is_deterministic() -> None:
 
 def test_robot_poses_move_at_constant_speed_and_follow_free_path() -> None:
     cfg = SimConfig(steps=12, dt=0.1, robot_speed=0.5)
-    layout = sample_layout(3, cfg)
+    layout, _ = sample_layout(3, cfg)
     path = plan_path(layout, np.random.default_rng(3))
     poses = robot_poses(path, cfg.steps, cfg.dt, cfg.robot_speed)
     assert poses.shape == (cfg.steps, 4, 4)

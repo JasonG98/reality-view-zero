@@ -1,0 +1,4 @@
+sim:
+  scene: small_warehouse
+  robot_res: 512
+  drone_res: 768

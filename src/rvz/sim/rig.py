@@ -13,6 +13,7 @@ from rvz.sim.layout import Layout
 
 ROBOT_BODY_Z = 0.1
 ROBOT_HALF_EXTENTS = (0.30, 0.20, 0.10)
+LOOKAT_HEIGHT_OFFSET_M = 0.15  # 无人机看向点相对小车中心抬高，落到车身中部
 
 
 def robot_poses(path: np.ndarray, n_steps: int, dt: float, speed: float) -> np.ndarray:
@@ -89,7 +90,7 @@ def drone_trajectories(
         )
 
         lookat = robot_world_poses[:, :3, 3].astype(np.float64).copy()
-        lookat[:, 2] += 0.15
+        lookat[:, 2] += LOOKAT_HEIGHT_OFFSET_M
         lookat[:, 0] = np.clip(lookat[:, 0], -layout.width / 2.0, layout.width / 2.0)
         lookat[:, 1] = np.clip(lookat[:, 1], -layout.depth / 2.0, layout.depth / 2.0)
         trajectories.append(

@@ -1,5 +1,6 @@
-"""CLI 参数解析与 doctor 调度的契约测试。"""
+"""CLI 参数解析与子命令调度的契约测试。"""
 
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -94,3 +95,38 @@ def test_viz_episode_arguments_and_dispatch(monkeypatch: pytest.MonkeyPatch) -> 
     assert exit_code == 0
     load_config.assert_called_once_with(None, [])
     viz_episode.assert_called_once_with("data/raw/ep_000002.npz", "runs/viz/test", step=2, drone_index=1)
+
+
+def test_viewer_arguments_and_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = Config()
+    load_config = Mock(return_value=config)
+    run_viewer = Mock()
+    monkeypatch.setattr(cli, "load_config", load_config)
+    monkeypatch.setattr(cli, "run_viewer", run_viewer)
+
+    exit_code = cli.main(
+        ["viewer", "--config", "configs/mac_debug.yaml", "--seed", "6", "--drone-index", "1", "--set", "sim.dt=0.05"]
+    )
+
+    assert exit_code == 0
+    load_config.assert_called_once_with("configs/mac_debug.yaml", ["sim.dt=0.05"])
+    run_viewer.assert_called_once_with(6, config.sim, drone_index=1)
+
+
+@pytest.mark.parametrize(("overrides", "drone_res"), [([], 768), (["--set", "sim.drone_res=640"], 640)])
+def test_viewer_uses_high_resolution_warehouse_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, overrides: list[str], drone_res: int
+) -> None:
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "viewer.yaml"
+    load_config = Mock(wraps=cli.load_config)
+    run_viewer = Mock()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "load_config", load_config)
+    monkeypatch.setattr(cli, "run_viewer", run_viewer)
+
+    assert cli.main(["viewer", *overrides]) == 0
+
+    load_config.assert_called_once_with(str(config_path), overrides[1:])
+    config = run_viewer.call_args.args[1]
+    assert config.scene == "small_warehouse"
+    assert (config.robot_res, config.drone_res) == (512, drone_res)

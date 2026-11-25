@@ -17,6 +17,7 @@ from rvz.config import load_config  # 须晚于 MUJOCO_GL 设置（import 链会
 from rvz.data.viz import viz_episode
 from rvz.doctor import run_doctor  # 须晚于 MUJOCO_GL 设置
 from rvz.sim.record import generate_many
+from rvz.viewer import run_viewer
 
 _STATUS_ICON = {"pass": "✅", "fail": "❌", "skip": "⚠️"}
 
@@ -85,6 +86,26 @@ class VizEpisodeCommand:
     ] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ViewerCommand:
+    """实时显示左侧小车四路相机和右侧无人机视角。
+
+    Args:
+        seed: 仓库布局与小车轨迹的非负随机种子。
+        config: YAML 配置路径，默认使用 configs/viewer.yaml。
+        drone_index: 无人机下标，从 0 开始。
+        overrides: 覆盖配置项。
+    """
+
+    seed: int = 0
+    config: str = str(Path(__file__).with_name("viewer.yaml").resolve())
+    drone_index: int = 0
+    overrides: Annotated[
+        tyro.conf.UseAppendAction[list[str]],
+        tyro.conf.arg(name="set", metavar="a.b.c=value"),
+    ] = field(default_factory=list)
+
+
 def _print_report(report: dict) -> None:
     for check in report["checks"]:
         icon = _STATUS_ICON[check["status"]]
@@ -106,7 +127,12 @@ def _parse_seed_range(text: str) -> list[int]:
 
 def main(argv: list[str] | None = None) -> int:
     command = tyro.extras.subcommand_cli_from_dict(
-        {"doctor": DoctorCommand, "gen-data": GenDataCommand, "viz-episode": VizEpisodeCommand},
+        {
+            "doctor": DoctorCommand,
+            "gen-data": GenDataCommand,
+            "viz-episode": VizEpisodeCommand,
+            "viewer": ViewerCommand,
+        },
         prog="rvz",
         description="reality-view-zero：多视角相机 → 无人机视角生成",
         args=argv,
@@ -122,6 +148,9 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = command.out or cfg.data.raw_dir
         generate_many(seeds, cfg.sim, out_dir, command.workers)
         print(f"已生成 {len(seeds)} 个 episode：{Path(out_dir)}")
+        return 0
+    if isinstance(command, ViewerCommand):
+        run_viewer(command.seed, cfg.sim, drone_index=command.drone_index)
         return 0
     assert isinstance(command, VizEpisodeCommand)
     outputs = viz_episode(command.episode, command.out, step=command.step, drone_index=command.drone_index)

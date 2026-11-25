@@ -89,7 +89,7 @@ plucker = [d_B, o_B × d_B]   # 6 维
 - 校验器 `data.schema.validate_episode` 必须检查形状、dtype、旋转矩阵正交性（容差 1e-4）、位姿最后一行为 `[0,0,0,1]`。
 
 ### 3.2 划分
-布局是 seed 的确定性函数，所以按 seed 划分就是按布局划分：
+程序化布局是 seed 的确定性函数，该数据集按 seed 划分即按布局划分。导入的小型仓库共用一个布局，seed 控制路线与无人机机位。程序化数据集的划分如下。
 
 | 划分 | seed 范围（初值） |
 |---|---|
@@ -114,10 +114,10 @@ plucker = [d_B, o_B × d_B]   # 6 维
 
 | 编号 | 需求 |
 |---|---|
-| FR-SIM-1 | 给定 `seed` 与 `SimConfig`，**确定性**生成仓库式布局：矩形，边长 12–20 m（初值），**无天花板**；3–6 条通道；货架行（box 几何体）+ 随机堆叠箱子；托盘；散落障碍与少量干扰物 |
-| FR-SIM-2 | 随机化：墙/地面纹理与颜色、货架/箱子颜色、1–3 盏灯、天空/背景 |
+| FR-SIM-1 | `sim.scene=procedural` 时，给定 `seed` 与 `SimConfig`，**确定性**生成仓库式布局：矩形，边长 12–20 m（初值），**无天花板**；3–6 条通道；货架行（box 几何体）+ 随机堆叠箱子；托盘；散落障碍与少量干扰物 |
+| FR-SIM-2 | 程序化场景随机化墙/地面纹理与颜色、货架/箱子颜色、1–3 盏灯、天空/背景 |
 | FR-SIM-3 | 布局同时产出 2D 空闲栅格；小车路径在栅格上随机选点 + A*，无碰撞，匀速 |
-| FR-SIM-4 | 小车为**运动学刚体**，不调用 `mj_step`：每步直接设位姿，调用 `mj_forward` 后渲染。车体带不对称标记，保证无人机画面里能看出朝向 |
+| FR-SIM-4 | 小车为**运动学刚体**，不调用 `mj_step`：每步直接设位姿，调用 `mj_forward` 后渲染。车体有倒角车壳、轮组、相机外壳和前后灯，车头灯标用于辨认朝向和校验重投影 |
 | FR-SIM-5 | 小车 4 路固定相机（挂车体，安装高度约 0.3 m）：前后 FOV 90°；左右为 120° 垂直 FOV 广角并下倾 15°，覆盖近车侧地面。无人机为 **MuJoCo 自由相机**（看向点、距离、方位角、俯仰角），每步每台更新 |
 | FR-SIM-6 | 每步 `M=3` 台无人机相机，方位角严格等于小车当前 `yaw(t)`，相机位于小车**正后方**，不使用随机方位偏置、环绕角速度或侧向避障；各台标称距离 1.4–2.2 m、离地 0.3–1.5 m、俯仰角 −30° 至 −15°（均为初值），看向小车中心。正后方有墙体/货架时保持方向不变，平滑缩短跟随距离（最短 0.45 m，相邻步变化 ≤0.12 m），不得穿模 |
 | FR-SIM-7 | 无人机相机位置**不得在任何几何体内**，且小车必须在其视野内（含朝向标记）；违反则重采样。仅对当前无人机画面，用射线找出相机到小车之间的环境几何体并自动隐藏；小车四路相机、其他无人机和碰撞布局保持不变 |
@@ -125,6 +125,9 @@ plucker = [d_B, o_B × d_B]   # 6 维
 | FR-SIM-9 | 位姿从渲染后场景里的 GL 相机（位置、前向、上向量）读出，再转 OpenCV 约定；单目模式读取左右 GL 相机的平均值，与 MuJoCo 实际单目渲染一致，避免默认 IPD 的半眼距横移。**禁止手写方位角/俯仰角公式**。注意 MuJoCo `mjvCamera.elevation` 的符号约定：**负值 = 相机在上方俯视**（M0 实测确认） |
 | FR-SIM-10 | 多进程并行生成，每进程独立渲染器；Linux 使用 `MUJOCO_GL=egl`，Mac 用默认后端 |
 | FR-SIM-11 | `rvz.sim` **不得导入 torch** |
+| FR-SIM-12 | `sim.scene=small_warehouse` 使用 AWS RoboMaker 发布的无屋顶小型仓库，保留原模型摆放和贴图。按导入几何构建导航栅格，两种场景共用小车与两类相机 |
+
+录制和预览按同一顺序选择无人机机位。整段轨迹须逐帧通过几何检查，且渲染画面中能检出车头灯标质心，重投影误差为有限值。
 
 ---
 
@@ -137,7 +140,7 @@ plucker = [d_B, o_B × d_B]   # 6 维
 - 冻结模式：`no_grad`，使用特征缓存。LoRA 模式：在线编码（不使用缓存），仅 LoRA 参数可训。
 
 ### 5.2 生成器（FR-MOD-2）
-- DiT 风格 Transformer，**像素空间，不用潜空间/解码器**；目标分辨率 `Hd×Wd`（默认 128；当前 Mac 调试与预览为 256），patch 8。
+- DiT 风格 Transformer，**像素空间，不用潜空间/解码器**；目标分辨率 `Hd×Wd`（默认 128；Mac D0 为 256），patch 8。
 - 输入：带噪图像 patch token、时间嵌入（flow matching 用 `t`，MeanFlow 用 `(r, t)`）、上下文 token、射线嵌入、递归条件 token。
 - 上下文 token：4 相机 × 步 `{t, t−1}`，每个 token = 投影后的特征 + 该 patch 的 Plücker 嵌入 + 相机/时间嵌入。
 - 注入方式：目标 token 对上下文 token 做 cross-attention；时间步用 AdaLN。
@@ -221,7 +224,7 @@ batch=1；预热 10 次，测 50 次；计时前后做设备同步；报告 1/2/
 | 项 | Linux + RTX 5060 Ti 16G | Mac M1 Pro |
 |---|---|---|
 | 角色 | 最终数据集生成、特征缓存、全部训练 | 开发调试、D0、`fm`/`fm_rec`、推理与可视化 |
-| MuJoCo 渲染 | EGL（需 NVIDIA EGL/GLVND 用户态库） | 默认后端（cgl）；交互窗口才需 `mjpython` |
+| MuJoCo 渲染 | EGL（需 NVIDIA EGL/GLVND 用户态库） | 默认后端（cgl）；MuJoCo 原生被动查看器需 `mjpython` |
 | 精度 | bf16 autocast | **fp32**（M0 实测 MPS bf16 matmul 可运行；fp32 为既定策略，不变） |
 | PyTorch | **CUDA 12.8+ 构建**（Blackwell sm_120 需要 PyTorch ≥ 2.7） | MPS；最新版要求 macOS 15+、Python 3.11+ |
 | 注意力 | `scaled_dot_product_attention` | 同左；不依赖 flash-attn/xformers |
@@ -252,6 +255,7 @@ batch=1；预热 10 次，测 50 次；计时前后做设备同步；报告 1/2/
 | `doctor` | M0 可行性检查，输出 ✅/❌ 表，写 `runs/doctor_<platform>.json` |
 | `gen-data` | 生成 episode（`--seeds a:b --workers N --out data/raw`） |
 | `viz-episode` | 把一个 episode 导出为图片/视频，并画出位姿重投影检查图 |
+| `viewer` | 按 `sim.dt` 实时预览指定 `--seed` 的仿真，左侧小车相机四宫格，右侧 `--drone-index` 指定的无人机视角 |
 | `cache-feats` | 缓存编码器特征（幂等，manifest 校验） |
 | `train` | 训练（`--stage`、`--run`、`--resume`、`--overfit-episode`） |
 | `sample` | 用 checkpoint 对指定 episode 采样并保存图片 |
@@ -259,6 +263,8 @@ batch=1；预热 10 次，测 50 次；计时前后做设备同步；报告 1/2/
 | `bench` | 延迟与显存测试 |
 
 所有子命令统一接收 `--config`，并支持 `--set a.b.c=value` 覆盖配置。
+
+`viewer` 使用 Tk 桌面窗口，默认 `--seed 0 --drone-index 0`。默认配置 `configs/viewer.yaml` 选用导入的小型仓库，小车每路原生渲染 512×512，无人机原生渲染 768×768。小车相机按 `front, left, right, back` 从左到右、从上到下排列，与无人机画面同步渲染。沿路径循环，关闭窗口或按 `Esc` 退出。
 
 ---
 
@@ -294,7 +300,7 @@ batch=1；预热 10 次，测 50 次；计时前后做设备同步；报告 1/2/
 | 里程碑 | 交付物 | 退出条件 | 依赖 |
 |---|---|---|---|
 | **M0 环境与可行性** | `pyproject.toml`（uv，平台标记的 torch 源）、`config.py`、`device.py`、`doctor.py` | G0；§12.2 的未决问题逐项有结论 | — |
-| **M1 仿真与数据管线** | `geometry.py`、`sim/*`、`data/schema.py`、`gen-data`、`viz-episode`、对应测试 | G1 | M0 |
+| **M1 仿真与数据管线** | `geometry.py`、`sim/*`、`data/schema.py`、`gen-data`、`viz-episode`、`viewer`、对应测试 | G1 | M0 |
 | **M2 特征缓存与基线** | `models/encoder.py`、`data/features.py`、`data/dataset.py`、`cache-feats`、`regress` 阶段、`evaluate/metrics.py` 与基线 | G2 | M1 |
 | **M3 flow matching** | `models/rays.py`、`models/generator.py`、`models/sampler.py`、`train/*`（`fm`）、`sample` | G3 | M2 |
 | **M4 时间递归** | `fm_rec` 阶段、滚动推理、漂移评估 | G4 | M3 |
@@ -324,6 +330,13 @@ batch=1；预热 10 次，测 50 次；计时前后做设备同步；报告 1/2/
 | 2026-11-25 | §2、§3.1、§4 FR-SIM-5/8；ARCH §2、§4、§5 | 左右小车相机改为 120° 垂直 FOV、下倾 15°，前后和无人机保持 90°；`K_robot` 改为逐相机 `[4,3,3]`，schema 升至 v2；24 个 256×256 episode 全部通过，最大重投影误差 0.829 px，默认测试 53 passed | 参考量产车侧后视镜/环视相机的侧装与广角覆盖，增加近车侧地面可见性；不模拟鱼眼畸变，G1 的 2 px 阈值不变 |
 | 2026-11-25 | pyproject；§9、§12.2-7 | 新增运行依赖 `socksio`（`uv add socksio`）；Linux 上 `rvz doctor --download` 完成真实 DINOv3-B 下载与 CUDA 前向（tokens shape=(1,201,768)），HF gated 协议经 huggingface-cli 凭据通过；G0（linux）通过 | 本机经 SOCKS 代理（socks5://127.0.0.1:7890）访问 Hugging Face，huggingface_hub 的 httpx 客户端需要 `socksio` 才能走该代理；见 §12.2-7 修正 |
 | 2026-11-25 | §12.2-6/10/11；`doctor` | G0 双平台通过：跨平台像素自动对比平均绝对差 0.138/255（最大 15，相机位置差 0 m）；npz 跨机拷贝实测读入成功；双平台 `uv sync` 均通过；`doctor` 的 `uv_lock`/`npz_roundtrip` 待复核平台消息改为按平台生成（新增 `_pending_platform()` 与回归测试，默认测试 54 passed） | Mac 补齐 G0 剩余项；修复 Linux 上"待 Linux 运行"的自相矛盾消息 |
+| 2026-11-25 | §8、§9、§11.2；ARCH §2、§5.2、§7 | 增加 `rvz viewer`，同步预览四路小车相机与一路无人机视角 | 运行时检查相机画面与无人机跟随效果 |
+| 2026-11-26 | §3.2、§4 FR-SIM-4/12、§5.2、§9；ARCH §2、§5.2 | 导入 AWS RoboMaker 无屋顶小型仓库作为默认预览场景，小车相机升至 512×512，无人机升至 768×768。细化小车外观并调整广角相机近裁剪面 | 使用现成仓库资产改善画面，提升预览清晰度 |
+| 2026-11-26 | ARCH §5.2 | 场景组装收敛到 `scene.build_scene`（record 不再持有布局→模型逻辑）；新增 `layout.required_path_length`、`geometry.marker_world`、`rig.LOOKAT_HEIGHT_OFFSET_M` 消除重复公式与魔法数；仓库模型按 `cfg` 缓存；`SimConfig.scene` 用 `SceneName` Literal 单一来源 | `/simplify` 复审：去重与抬高抽象层次，行为不变，默认测试 61 passed |
+| 2026-11-26 | §4 FR-SIM-7；ARCH §5.2 | 录制与预览共用无人机单帧校验和整段轨迹重采样 | 前序机位重采样时，预览与录制的机位选择仍逐帧一致 |
+| 2026-11-26 | ARCH §5.2 | 公开 `rvz.sim.record.marker_centroid` | 通过公开入口覆盖灯标检测的回归测试 |
+| 2026-11-26 | §4 FR-SIM-2；ARCH §5.2 | `sample_layout` 分别返回 `Layout` 和 `ProceduralColors`，`layout_to_mjcf` 显式接收颜色 | 程序化纹理颜色随布局采样，导入仓库直接使用资产材质 |
+| 2026-11-26 | §9；ARCH §2、§5.2 | `viewer` 默认加载随包分发的 `configs/viewer.yaml`，子命令统一加载配置 | 高清预览和录制示例共用一份小型仓库配置 |
 
 ### 12.2 M0 必须解决的未决问题（均对应 `doctor` 检查项）
 

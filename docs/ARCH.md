@@ -31,7 +31,8 @@ reality-view-zero/
 │   └── ARCH.md
 ├── configs/
 │   ├── mac_debug.yaml
-│   └── linux_main.yaml
+│   ├── linux_main.yaml
+│   └── viewer.yaml
 ├── src/
 │   └── rvz/
 │       ├── __init__.py
@@ -40,10 +41,13 @@ reality-view-zero/
 │       ├── device.py            # 设备/精度/随机种子/同步
 │       ├── geometry.py          # 位姿、相机约定转换、重投影（纯 numpy）
 │       ├── doctor.py            # M0 可行性检查
+│       ├── viewer.py            # Tk 桌面窗口，同步显示五路相机
+│       ├── viewer.yaml          # 指向 configs/viewer.yaml 的链接，随包分发
 │       ├── sim/                 # 不得导入 torch
 │       │   ├── __init__.py
 │       │   ├── layout.py        # 布局采样、空闲栅格、A*
-│       │   ├── scene.py         # 布局 → MJCF 字符串
+│       │   ├── scene.py         # 程序化 MJCF、仓库资产加载和车体组装
+│       │   ├── assets/          # 离线仓库资产与授权说明
 │       │   ├── rig.py           # 小车相机、无人机自由相机、轨迹
 │       │   └── record.py        # episode 录制与多进程生成 → npz
 │       ├── data/
@@ -251,6 +255,7 @@ MARKER_LOCAL = (0.20, 0.0, 0.18)                          # 车体朝向标记�
 def gl_cam_to_cv_pose(pos, forward, up) -> np.ndarray       # -> T_W_Ccv (4,4)
 def invert(T) -> np.ndarray
 def relative(T_W_a, T_W_b) -> np.ndarray                    # T_a_b
+def marker_world(T_W_B) -> np.ndarray                       # 朝向标记世界坐标 (3,)
 def intrinsics_from_fovy(fovy_deg, width, height) -> np.ndarray
 def project(K, T_C_W, pts_W) -> tuple[np.ndarray, np.ndarray]  # (uv, depth)
 def scale_K(K, sx, sy) -> np.ndarray
@@ -267,11 +272,15 @@ def scale_K(K, sx, sy) -> np.ndarray
 # layout.py
 @dataclass
 class Layout: ...                                   # 货架/箱子/托盘/墙/灯 + 空闲栅格
-def sample_layout(seed: int, cfg: SimConfig) -> Layout
+@dataclass(frozen=True)
+class ProceduralColors: ...                         # 墙面、地面和天空的纹理颜色
+def sample_layout(seed: int, cfg: SimConfig) -> tuple[Layout, ProceduralColors]
+def required_path_length(cfg: SimConfig) -> float   # 走完 steps 步的最短路径长度
 def plan_path(layout: Layout, rng) -> np.ndarray    # 栅格上的 A* 路径，(K,2) 米
 
 # scene.py
-def layout_to_mjcf(layout: Layout, cfg: SimConfig) -> str   # 含 4 个小车固定相机
+def layout_to_mjcf(layout: Layout, colors: ProceduralColors, cfg: SimConfig) -> str   # 含 4 个小车固定相机
+def build_scene(seed: int, cfg: SimConfig) -> tuple[Layout, mujoco.MjModel]  # 按 cfg.scene 分派；仓库模型按 cfg 缓存
 
 # rig.py
 def robot_poses(path, n_steps, dt, speed) -> np.ndarray       # (T,4,4) T_W_B，按弧长匀速采样
@@ -279,15 +288,20 @@ def drone_trajectories(rng, layout, robot_poses, cfg) -> list[DroneTraj]
 def read_gl_camera(renderer) -> tuple[pos, forward, up]      # 读取单目实际使用的双目平均相机
 
 # record.py
+def marker_centroid(image: np.ndarray, expected_uv: np.ndarray, marker_radius_px: float = 0.0) -> np.ndarray | None
 def generate_episode(seed: int, cfg: SimConfig) -> dict[str, np.ndarray | str]
 def generate_many(seeds, cfg, out_dir, workers: int) -> None   # 多进程，逐 episode 落盘
+def live_camera_frames(seed: int, cfg: SimConfig, drone_index: int = 0) -> Generator[tuple[np.ndarray, np.ndarray], None, None]
 ```
 要点：
+- `small_warehouse` 从包内归档加载发布方的仓库网格、贴图和物件位置。物件包围盒用于导航栅格、弹簧臂和机位检查，可见性射线只查询显示的网格。导入场景为正后方跟随机位留出规划余量。
+- 两种场景共用带倒角的车壳、轮组、灯标和相机组装。离屏缓冲覆盖实际渲染尺寸，较近的裁剪面保留广角相机下方的地面。
 - 小车每步：设位姿 → `mj_forward` → 渲染 4 路 → 对每台无人机设自由相机 → `update_scene` → 渲染 → 读出 GL 相机位姿 → `gl_cam_to_cv_pose`。
 - 小车前后相机使用 `fovy_deg`；左右相机使用 `robot_side_fovy_deg=120`、`robot_side_down_deg=15`，MJCF 中直接设置相机 XY 轴实现无滚转下倾，4 路内参分别写入 `K_robot`。
-- 无人机参数轨迹由 `rig` 生成为严格正后方的近低机位第三人称视角；`record` 先用射线计算机位前方的安全距离，通过双向限幅平滑缩短弹簧臂，再从单目实际使用的双目平均 GL 相机读取位姿；遮挡物通过 `mj_ray` 找出，仅在当前无人机画面用 geom group 隐藏，随后立即恢复模型分组；几何校验不通过时整段重采样。
+- `rig` 生成严格正后方的近低机位轨迹。`record` 先用射线计算机位前方的安全距离，通过双向限幅平滑缩短弹簧臂，再从单目实际使用的双目平均 GL 相机读取位姿。遮挡物通过 `mj_ray` 找出，仅在当前无人机画面用 geom group 隐藏，随后立即恢复模型分组。录制与预览逐帧校验几何、灯标质心和重投影误差有限性，任一步失败时整段重采样。
 - 无人机相机位置检查（不在几何体内、小车在视野内）使用 `Layout` 里的几何体 AABB，不依赖物理引擎碰撞。
 - 重采样有最大次数，超出抛异常；实际次数与发光标记重投影误差记录在 `meta` 中。
+- `viewer.py` 从 `live_camera_frames` 逐步读取同一时刻的小车 RGB `(4,H,W,3)` 和无人机 RGB `(Hd,Wd,3)`。预览沿用录制的候选批次与重采样顺序，依次预检到指定机位。`viewer` 默认加载 `configs/viewer.yaml`。窗口按屏幕尺寸布局并缩放画面，按 `sim.dt` 请求下一组，退出时关闭生成器和离屏渲染器。
 
 ### 5.3 `data`
 
@@ -397,7 +411,7 @@ def build_report(results, out_dir) -> None           # report.json + 对比图
 | 设备选择 | 只经 `device.get_device()` |
 | 精度 | 只经 `device.autocast_ctx()`；cuda=bf16，mps/cpu=fp32 |
 | 缺算子（MPS） | 设 `PYTORCH_ENABLE_MPS_FALLBACK=1`；日志中记录回退的算子，避免悄悄变慢 |
-| MuJoCo 后端 | Linux 在启动时设置 `MUJOCO_GL=egl`（`doctor`/`gen-data` 入口里设置，**必须在 `import mujoco` 之前**）；Mac 不设 |
+| MuJoCo 后端 | Linux 在 CLI 入口设置 `MUJOCO_GL=egl`（**必须在 `import mujoco` 之前**）；Mac 不设；`viewer` 使用相同的离屏后端并通过 Tk 显示 |
 | 注意力 | 统一 SDPA；不依赖 flash-attn/xformers；不用 `torch.compile` |
 | 计时 | 计时前后调用 `device.sync()` |
 

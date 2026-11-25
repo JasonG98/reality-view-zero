@@ -4,13 +4,14 @@ import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypeVar, get_type_hints
+from typing import Literal, TypeVar, get_args, get_type_hints
 
 import yaml
 
 # YAML 解析结果的递归类型，避免 Any。
 YamlValue = None | bool | int | float | str | list["YamlValue"] | dict[str, "YamlValue"]
 SCHEMA_VERSION = 2
+SceneName = Literal["procedural", "small_warehouse"]
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class SimConfig:
     drone_elevation_min_deg: float = -30.0
     drone_elevation_max_deg: float = -15.0
     max_resamples: int = 100
+    scene: SceneName = "procedural"
 
     def __post_init__(self) -> None:
         if self.robot_res <= 0 or self.drone_res <= 0 or self.steps <= 0 or self.n_drones <= 0:
@@ -63,6 +65,8 @@ class SimConfig:
             raise ValueError("无人机俯仰角范围无效")
         if self.max_resamples <= 0:
             raise ValueError("max_resamples 必须为正整数")
+        if self.scene not in get_args(SceneName):
+            raise ValueError(f"未知场景：{self.scene}")
 
 
 @dataclass(frozen=True)

@@ -46,13 +46,17 @@ class Layout:
     depth: float
     boxes: tuple[Box, ...]
     lights: tuple[Light, ...]
-    floor_colors: np.ndarray
-    wall_colors: np.ndarray
-    sky_colors: np.ndarray
     grid_resolution: float
     robot_radius: float
     occupied: np.ndarray
     min_path_length: float
+
+
+@dataclass(frozen=True)
+class ProceduralColors:
+    wall: np.ndarray
+    floor: np.ndarray
+    sky: np.ndarray
 
 
 def _color(rng: np.random.Generator) -> np.ndarray:
@@ -66,9 +70,15 @@ def _overlaps(first: Box, second: Box) -> bool:
     return bool(np.all(np.minimum(first_max, second_max) - np.maximum(first_min, second_min) > 1e-5))
 
 
-def _occupied_grid(
+def required_path_length(cfg: SimConfig) -> float:
+    """小车走完 cfg.steps 步所需的最短路径长度。"""
+    return (cfg.steps - 1) * cfg.robot_speed * cfg.dt
+
+
+def occupied_grid(
     width: float, depth: float, resolution: float, robot_radius: float, boxes: tuple[Box, ...]
 ) -> np.ndarray:
+    """按规划安全半径膨胀场景包围盒，得到二维占用栅格。"""
     nx, ny = int(width / resolution), int(depth / resolution)
     xs = (np.arange(nx) + 0.5) * resolution - width / 2.0
     ys = (np.arange(ny) + 0.5) * resolution - depth / 2.0
@@ -108,15 +118,17 @@ def _free_box(
     return None
 
 
-def sample_layout(seed: int, cfg: SimConfig) -> Layout:
-    """由 seed 确定性生成仓库、随机纹理颜色和空闲栅格。"""
+def sample_layout(seed: int, cfg: SimConfig) -> tuple[Layout, ProceduralColors]:
+    """由 seed 确定性生成程序化仓库布局和纹理颜色。"""
     rng = np.random.default_rng(seed)
     width = float(rng.uniform(cfg.warehouse_min_size, cfg.warehouse_max_size))
     depth = float(rng.uniform(cfg.warehouse_min_size, cfg.warehouse_max_size))
     n_aisles = int(rng.integers(cfg.min_aisles, cfg.max_aisles + 1))
-    wall_colors = rng.uniform(0.25, 0.75, (2, 3)).astype(np.float32)
-    floor_colors = rng.uniform(0.20, 0.65, (2, 3)).astype(np.float32)
-    sky_colors = rng.uniform(0.30, 0.85, (2, 3)).astype(np.float32)
+    colors = ProceduralColors(
+        wall=rng.uniform(0.25, 0.75, (2, 3)).astype(np.float32),
+        floor=rng.uniform(0.20, 0.65, (2, 3)).astype(np.float32),
+        sky=rng.uniform(0.30, 0.85, (2, 3)).astype(np.float32),
+    )
     boxes: list[Box] = []
     wall_specs = [
         ("wall_north", (0.0, depth / 2.0 - 0.1, 1.0), (width, 0.2, 2.0)),
@@ -194,23 +206,20 @@ def sample_layout(seed: int, cfg: SimConfig) -> Layout:
         direction = -position / np.linalg.norm(position)
         diffuse = rng.uniform(0.65, 1.0, 3).astype(np.float32)
         lights.append(Light(position, direction.astype(np.float32), diffuse))
-    occupied = _occupied_grid(width, depth, cfg.grid_resolution, cfg.robot_radius, tuple(boxes))
+    occupied = occupied_grid(width, depth, cfg.grid_resolution, cfg.robot_radius, tuple(boxes))
     layout = Layout(
         seed=seed,
         width=width,
         depth=depth,
         boxes=tuple(boxes),
         lights=tuple(lights),
-        floor_colors=floor_colors,
-        wall_colors=wall_colors,
-        sky_colors=sky_colors,
         grid_resolution=cfg.grid_resolution,
         robot_radius=cfg.robot_radius,
         occupied=occupied,
-        min_path_length=(cfg.steps - 1) * cfg.robot_speed * cfg.dt,
+        min_path_length=required_path_length(cfg),
     )
     validate_layout(layout)
-    return layout
+    return layout, colors
 
 
 def validate_layout(layout: Layout) -> None:
@@ -243,7 +252,7 @@ def validate_layout(layout: Layout) -> None:
         for other in layout.boxes[index + 1 :]:
             if _overlaps(box, other):
                 raise ValueError(f"几何体重叠：{box.name} 与 {other.name}")
-    expected = _occupied_grid(layout.width, layout.depth, layout.grid_resolution, layout.robot_radius, layout.boxes)
+    expected = occupied_grid(layout.width, layout.depth, layout.grid_resolution, layout.robot_radius, layout.boxes)
     if not np.array_equal(layout.occupied, expected):
         raise ValueError("空闲栅格与几何体 AABB 不一致")
 

@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from rvz.data.schema import CAM_ORDER, validate_episode
-from rvz.geometry import MARKER_LOCAL, invert, project
+from rvz.geometry import invert, marker_world, project
 
 
 def _cross(draw: ImageDraw.ImageDraw, uv: np.ndarray, color: str) -> None:
@@ -53,8 +53,8 @@ def viz_episode(
     draw = ImageDraw.Draw(reprojection)
     T_W_B = episode["T_W_B"][step]
     T_W_C = episode["T_W_Cdrone"][step, drone_index]
-    marker_world = (T_W_B @ np.array([*MARKER_LOCAL, 1.0]))[:3]
-    marker_uv, _ = project(episode["K_drone"], invert(T_W_C), marker_world[None])
+    marker_position = marker_world(T_W_B)
+    marker_uv, _ = project(episode["K_drone"], invert(T_W_C), marker_position[None])
     robot_uv, _ = project(episode["K_drone"], invert(T_W_C), T_W_B[:3, 3][None])
     _cross(draw, marker_uv[0] * scale, "cyan")
     _cross(draw, robot_uv[0] * scale, "yellow")

@@ -43,6 +43,11 @@ def relative(T_W_a: np.ndarray, T_W_b: np.ndarray) -> np.ndarray:
     return (invert(T_W_a) @ T_W_b).astype(np.float32)
 
 
+def marker_world(T_W_B: np.ndarray) -> np.ndarray:
+    """车体朝向标记在世界系中的坐标 (3,)。"""
+    return (T_W_B @ np.array([*MARKER_LOCAL, 1.0], dtype=np.float64))[:3]
+
+
 def intrinsics_from_fovy(fovy_deg: float, width: int, height: int) -> np.ndarray:
     """按 MuJoCo 的垂直视场和像素中心约定构造 OpenCV 内参。"""
     focal = height / 2.0 / math.tan(math.radians(fovy_deg) / 2.0)
