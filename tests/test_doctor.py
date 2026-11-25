@@ -1,8 +1,11 @@
 """doctor 的 GL 投影纯函数测试：已知相机位姿下的解析像素坐标。"""
 
-import numpy as np
+import sys
 
-from rvz.doctor import project_gl
+import numpy as np
+import pytest
+
+from rvz.doctor import _check_npz_roundtrip, _check_uv_lock, project_gl
 
 
 def test_project_gl_center_and_offsets() -> None:
@@ -34,3 +37,11 @@ def test_project_gl_camera_looks_down_x() -> None:
     )
     np.testing.assert_allclose(uv[0], [63.5, 63.5], atol=1e-6)
     assert depth[0] > 0
+
+
+def test_pending_platform_messages_follow_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """§12.2-10/11 回归：待复核平台必须指向本机之外（Linux 上不能写"待 Linux 运行"）。"""
+    for host, other in (("darwin", "Linux"), ("linux", "Mac")):
+        monkeypatch.setattr(sys, "platform", host)
+        assert f"{other} 平台 sync 待运行" in _check_uv_lock().detail
+        assert f"跨机拷贝待 {other} 复核" in _check_npz_roundtrip().detail

@@ -20,6 +20,8 @@ dependencies = [
   "pyyaml",
   "tqdm",
   "tyro>=1.0.17",
+  "httpx[socks]>=0.28.1",
+  "socksio>=1.0.0",
 ]
 
 [project.scripts]

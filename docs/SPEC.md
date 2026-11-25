@@ -322,6 +322,8 @@ batch=1；预热 10 次，测 50 次；计时前后做设备同步；报告 1/2/
 | 2026-11-25 | §4 FR-SIM-6/7/9、§5.2、§8.1；ARCH §5.2 | 按目标视角改为严格正后方：移除随机偏置、角速度配置和侧向避让；仅对当前无人机画面用 `mj_ray` 查找并隐藏遮挡物，其他相机与布局不变；单目位姿改读左右 GL 相机平均；Mac D0 和预览升至 256×256；24 个 episode 校验通过，最大重投影误差 0.626 px，正后方横向偏差 ≤5.4e-7 m，默认测试 51 passed | 用户要求正后方而非斜后方，并要求遮挡物自动隐藏和更高图像分辨率；G1 阈值与 schema v1 不变 |
 | 2026-11-25 | §4 FR-SIM-6；ARCH §5.2 | 无人机标称距离缩至 1.4–2.2 m，高度范围降至 0.3–1.5 m、俯仰改为 −30° 至 −15°；加入正后方弹簧臂，遇几何体时平滑缩短距离（最短 0.45 m、相邻步 ≤0.12 m），不穿模且不转斜后方；最终 24 个 256×256 episode 最大重投影误差 0.829 px，默认测试 52 passed | 用户要求相机更近、更低；固定近距离在少数转弯布局会穿墙；G1 阈值与 schema v1 不变 |
 | 2026-11-25 | §2、§3.1、§4 FR-SIM-5/8；ARCH §2、§4、§5 | 左右小车相机改为 120° 垂直 FOV、下倾 15°，前后和无人机保持 90°；`K_robot` 改为逐相机 `[4,3,3]`，schema 升至 v2；24 个 256×256 episode 全部通过，最大重投影误差 0.829 px，默认测试 53 passed | 参考量产车侧后视镜/环视相机的侧装与广角覆盖，增加近车侧地面可见性；不模拟鱼眼畸变，G1 的 2 px 阈值不变 |
+| 2026-11-25 | pyproject；§9、§12.2-7 | 新增运行依赖 `socksio`（`uv add socksio`）；Linux 上 `rvz doctor --download` 完成真实 DINOv3-B 下载与 CUDA 前向（tokens shape=(1,201,768)），HF gated 协议经 huggingface-cli 凭据通过；G0（linux）通过 | 本机经 SOCKS 代理（socks5://127.0.0.1:7890）访问 Hugging Face，huggingface_hub 的 httpx 客户端需要 `socksio` 才能走该代理；见 §12.2-7 修正 |
+| 2026-11-25 | §12.2-6/10/11；`doctor` | G0 双平台通过：跨平台像素自动对比平均绝对差 0.138/255（最大 15，相机位置差 0 m）；npz 跨机拷贝实测读入成功；双平台 `uv sync` 均通过；`doctor` 的 `uv_lock`/`npz_roundtrip` 待复核平台消息改为按平台生成（新增 `_pending_platform()` 与回归测试，默认测试 54 passed） | Mac 补齐 G0 剩余项；修复 Linux 上"待 Linux 运行"的自相矛盾消息 |
 
 ### 12.2 M0 必须解决的未决问题（均对应 `doctor` 检查项）
 
@@ -338,17 +340,17 @@ batch=1；预热 10 次，测 50 次；计时前后做设备同步；报告 1/2/
 5. 多进程渲染在两个平台上都稳定。
    → ✅ darwin：spawn 2 worker × 10 帧正常出图。Linux：待运行。
 6. 同一场景同一位姿跨平台像素差异的量级。
-   → 待运行：本机参考已写 `runs/doctor_assets/ref_darwin.npz`，Linux 运行 `rvz doctor` 后自动对比并报告量级。
+   → ✅ 双平台（2026-11-25）：Mac（cgl）与 Linux（EGL）参考图自动对比，平均绝对差 **0.138/255**，最大 **15/255**，相机位置差 **0 m**；差异集中在个别像素。
 7. DINOv3-B 前向在 MPS 与 CUDA 上可用；`transformers` 版本支持；HF 协议已同意。
-   → 部分验证 ✅ darwin：transformers 5.24.1 提供 `DINOv3ViTModel`/`DINOv3ViTConfig`；本地随机初始化小 DINOv3-ViT（2 层，hidden 64）MPS 前向正常，tokens shape=(1,7,64)（cls + 2 register + 4 patch）。**真实 DINOv3-B 权重与 HF 协议验证推迟到 M2**（模型体积大；另实测发现本机 SOCKS 代理缺 `socksio` 会阻断 transformers 下载，届时走 http 代理或在本机环境补 `socksio`，不列入项目依赖）。CUDA 侧：随 M2 在 Linux 验证。
+   → 部分验证 ✅ darwin：transformers 5.24.1 提供 `DINOv3ViTModel`/`DINOv3ViTConfig`；本地随机初始化小 DINOv3-ViT（2 层，hidden 64）MPS 前向正常，tokens shape=(1,7,64)（cls + 2 register + 4 patch）。**真实 DINOv3-B 权重与 HF 协议验证** ✅ linux（2026-11-25）：`rvz doctor --download` 经 huggingface-cli 凭据下载 gated 仓库 `facebook/dinov3-vitb16-pretrain-lvd1689m` 成功，CUDA 前向正常，tokens shape=(1,201,768)（cls + 4 register + 196 patch）。实测发现本机 SOCKS 代理会阻断 httpx 下载，已把 `socksio` 列入项目依赖（见 §12.1）。MPS 上真实权重前向：随 M2 在 Mac 复验。
 8. 5060 Ti 上 PyTorch CUDA 算子可运行（无 `no kernel image` 错误）。
    → 待运行：本机无 CUDA。Linux 需确认 torch 为 `+cu128` 构建（锁文件已含 cu128 索引条目）。
 9. MPS 上 `torch.func.jvp` 是否可用。
    → ✅ **可用**：MPS 上 jvp 与中心差分最大偏差 6.86e-04（fp32）。`pmf` 变体在 Mac 上不被 JVP 否决；`emf` 仍保留为备选（ADR-4）。
 10. 数据文件在两台机器间可无痛拷贝并读取。
-    → ✅ darwin：npz 压缩写入/读回一致（uint8/float32/字符串）。跨机实际拷贝：待 Linux 复核。
+    → ✅ 双平台：npz 压缩写入/读回一致（uint8/float32/字符串）；跨机实际拷贝已验证（`ref_linux.npz` 拷至 Mac 后读入并对比成功）。
 11. `uv sync` 在两个平台上都能解析并安装锁定的依赖。
-    → ✅ darwin：Python 3.11.15，torch 2.15.0、MuJoCo 4.0.1、transformers 5.24.1；`uv.lock` 含 darwin arm64 与 linux x86_64 双平台解析。Linux 安装：待运行。
+    → ✅ 双平台：darwin（Python 3.11.15，torch 2.15.0、MuJoCo 4.0.1、transformers 5.24.1）与 linux（Python 3.11.16，torch 2.11.0+cu128、MuJoCo 4.0.1、transformers 5.24.1）`uv sync` 均成功；`uv.lock` 含 darwin arm64 与 linux x86_64 双平台解析。
 12. `lpips` 首次使用会下载权重：确认两台机器的下载与缓存路径。
     → ✅ darwin：VGG 骨干下载与前向验证通过，缓存目录 `~/.cache/torch/hub/checkpoints`；已缓存时 `rvz doctor` 离线复验，未缓存需 `--download`。Linux：待运行。
 

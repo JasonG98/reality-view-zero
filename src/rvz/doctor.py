@@ -342,8 +342,13 @@ def _check_mps_bf16() -> CheckResult:
     )
 
 
+def _pending_platform() -> str:
+    """§12.2 双平台项：本机之外、仍待验证的平台名。"""
+    return "Linux" if sys.platform == "darwin" else "Mac"
+
+
 def _check_npz_roundtrip() -> CheckResult:
-    """§12.2-10：npz 写入/读回一致（跨平台字节兼容；实际拷贝待 Linux 验证）。"""
+    """§12.2-10：npz 写入/读回一致（跨平台字节兼容；实际跨机拷贝由另一平台复核）。"""
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "roundtrip.npz"
         rgb = np.arange(2 * 4 * 8 * 8 * 3, dtype=np.uint8).reshape(2, 4, 8, 8, 3)
@@ -353,23 +358,22 @@ def _check_npz_roundtrip() -> CheckResult:
             assert np.array_equal(z["robot_rgb"], rgb)
             assert np.array_equal(z["T_W_B"], poses)
             assert str(z["meta_json"]) == '{"seed": 0}'
-    return CheckResult(
-        "npz_roundtrip", "pass", "npz 压缩写入/读回一致（含 uint8/float32/字符串）；跨机拷贝待 Linux 复核"
-    )
+    detail = f"npz 压缩写入/读回一致（含 uint8/float32/字符串）；跨机拷贝待 {_pending_platform()} 复核"
+    return CheckResult("npz_roundtrip", "pass", detail)
 
 
 def _check_uv_lock() -> CheckResult:
-    """§12.2-11：锁文件存在且覆盖双平台；Linux 的 sync 待运行。"""
+    """§12.2-11：锁文件存在且覆盖双平台；另一平台的 sync 待运行。"""
     lock = Path("uv.lock")
     if not lock.exists():
         return CheckResult("uv_lock", "fail", "uv.lock 不存在，先执行 uv sync")
     text = lock.read_text(encoding="utf-8")
     has_cu128 = "cu128" in text
-    return CheckResult(
-        "uv_lock",
-        "pass" if has_cu128 else "fail",
-        f"本机 uv sync 成功；锁文件{'含' if has_cu128 else '不含'} cu128 索引条目；Linux 平台 sync 待运行",
+    detail = (
+        f"本机 uv sync 成功；锁文件{'含' if has_cu128 else '不含'} cu128 索引条目；"
+        f"{_pending_platform()} 平台 sync 待运行"
     )
+    return CheckResult("uv_lock", "pass" if has_cu128 else "fail", detail)
 
 
 def _check_lpips(download: bool) -> CheckResult:
