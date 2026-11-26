@@ -15,9 +15,14 @@
 uv sync
 uv run rvz doctor                       # M0 环境/可行性检查
 uv run rvz doctor --download            # 真实 DINOv3-B 权重（推迟到 M2）与 lpips 权重下载验证（需联网）
-uv run rvz gen-data --config configs/mac_debug.yaml --seeds 0:20 --workers 2
+uv run rvz gen-data --config configs/mac_debug.yaml --seeds 0:20 --workers 4
+uv run rvz gen-data --config configs/mac_debug.yaml --seeds 10000:10004 --workers 4
 uv run rvz viz-episode --episode data/raw/ep_000000.npz --out runs/viz/ep_000000
 uv run rvz viewer --seed 0
+uv run rvz cache-feats --config configs/mac_debug.yaml
+uv run rvz train --config configs/mac_debug.yaml --stage regress --run regress_d0
+uv run rvz eval --config configs/mac_debug.yaml --baseline copy_nearest_cam --split val --out runs/eval_copy_nearest
+uv run rvz eval --config configs/mac_debug.yaml --checkpoint runs/regress_d0/ckpt/latest.pt --split val --out runs/eval_regress
 uv run pytest -m "not slow and not gpu"
 uv run ruff check . && uv run ruff format --check .
 ```

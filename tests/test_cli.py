@@ -7,6 +7,7 @@ import pytest
 
 from rvz import cli
 from rvz.config import Config
+from rvz.evaluate.metrics import EvalReport, MetricSummary
 
 
 @pytest.mark.parametrize(("passed", "expected_exit_code"), [(True, 0), (False, 1)])
@@ -130,3 +131,81 @@ def test_viewer_uses_high_resolution_warehouse_by_default(
     config = run_viewer.call_args.args[1]
     assert config.scene == "small_warehouse"
     assert (config.robot_res, config.drone_res) == (512, drone_res)
+
+
+def test_cache_feats_arguments_and_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = Config()
+    encoder = Mock()
+    monkeypatch.setattr(cli, "load_config", Mock(return_value=config))
+    from_config = Mock(return_value=encoder)
+    monkeypatch.setattr(cli.FrozenEncoder, "from_config", from_config)
+    cache_mock = Mock(return_value={"total": 2, "cached": 2, "skipped": 0})
+    monkeypatch.setattr(cli, "cache_features", cache_mock)
+
+    exit_code = cli.main(["cache-feats", "--seeds", "0:2", "--batch-size", "8", "--out", "data/feats/custom"])
+
+    assert exit_code == 0
+    from_config.assert_called_once_with(config.encoder)
+    cache_mock.assert_called_once_with(
+        config.data.raw_dir,
+        Path("data/feats/custom"),
+        encoder,
+        config.encoder,
+        seeds=[0, 1],
+        batch_size=8,
+    )
+
+
+def test_train_arguments_and_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = Config()
+    monkeypatch.setattr(cli, "load_config", Mock(return_value=config))
+    run_train_mock = Mock(return_value=Path("runs/reg_d0/ckpt/latest.pt"))
+    monkeypatch.setattr(cli, "run_train", run_train_mock)
+
+    exit_code = cli.main(["train", "--stage", "regress", "--run", "reg_d0", "--resume", "--overfit-episode", "7"])
+
+    assert exit_code == 0
+    run_train_mock.assert_called_once_with(
+        config,
+        "regress",
+        Path("runs/reg_d0"),
+        resume=True,
+        overfit_seed=7,
+    )
+
+
+def test_eval_arguments_and_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = Config()
+    monkeypatch.setattr(cli, "load_config", Mock(return_value=config))
+    dummy = EvalReport(
+        name="copy_nearest_cam",
+        split="val",
+        num_samples=2,
+        lpips=MetricSummary(0.2, 0.01),
+        psnr=MetricSummary(18.0, 0.5),
+        ssim=MetricSummary(0.6, 0.02),
+        platform="test",
+        git_hash=None,
+        timestamp="now",
+    )
+    eval_nearest = Mock(return_value=dummy)
+    eval_ckpt = Mock(return_value=dummy)
+    monkeypatch.setattr(cli, "evaluate_copy_nearest_cam", eval_nearest)
+    monkeypatch.setattr(cli, "evaluate_checkpoint", eval_ckpt)
+
+    assert cli.main(["eval", "--baseline", "copy_nearest_cam", "--out", "runs/out_n"]) == 0
+    eval_nearest.assert_called_once_with(config, split="val", seeds=None, out_dir=Path("runs/out_n"), max_samples=None)
+
+    assert cli.main(["eval", "--checkpoint", "runs/r/ckpt/latest.pt", "--no-use-ema", "--max-samples", "10"]) == 0
+    eval_ckpt.assert_called_once_with(
+        "runs/r/ckpt/latest.pt",
+        config,
+        split="val",
+        seeds=None,
+        out_dir=Path("runs/eval_latest"),
+        use_ema=False,
+        max_samples=10,
+    )
+
+    with pytest.raises(ValueError, match=r"只能指定"):
+        cli.main(["eval"])

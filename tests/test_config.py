@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from rvz.config import Config, SimConfig, load_config
+from rvz.config import Config, EncoderConfig, ModelConfig, SimConfig, TrainConfig, dump_config, load_config
 
 
 def test_defaults_construct_without_file() -> None:
@@ -74,3 +74,17 @@ def test_shipped_configs_load() -> None:
     linux = load_config(root / "configs" / "linux_main.yaml")
     assert linux.sim.drone_res == 128
     assert linux.model.dim == 512
+
+
+def test_dump_config_roundtrip_and_new_validations(tmp_path: Path) -> None:
+    cfg = load_config(None, ["encoder.pool_2x2=true", "train.steps=25", "train.lpips_weight=0.5"])
+    snapshot = tmp_path / "snapshot.yaml"
+    snapshot.write_text(dump_config(cfg), encoding="utf-8")
+    assert load_config(snapshot) == cfg
+
+    with pytest.raises(ValueError, match=r"encoder\.res"):
+        EncoderConfig(res=0)
+    with pytest.raises(ValueError, match="整除"):
+        ModelConfig(dim=10, heads=3)
+    with pytest.raises(ValueError, match=r"train\.ema"):
+        TrainConfig(ema=1.0)

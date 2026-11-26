@@ -59,6 +59,7 @@ reality-view-zero/
 │       ├── models/
 │       │   ├── __init__.py
 │       │   ├── encoder.py       # 冻结 DINOv3（可选 LoRA）
+│       │   ├── regress.py       # M2 直接回归基线（无生成模型）
 │       │   ├── rays.py          # Plücker 射线嵌入（torch）
 │       │   ├── generator.py     # DiT 生成器（x-prediction）
 │       │   └── sampler.py       # flow matching / MeanFlow 采样
@@ -71,11 +72,15 @@ reality-view-zero/
 │           ├── metrics.py       # LPIPS/PSNR/SSIM、基线、分桶、延迟
 │           └── report.py        # report.json 与对比图
 ├── tests/
+│   ├── fakes.py                 # 离线假编码器与合成 episode 构造器
 │   ├── test_geometry.py
 │   ├── test_layout.py
 │   ├── test_schema.py
 │   ├── test_record.py
 │   ├── test_viz.py
+│   ├── test_encoder.py
+│   ├── test_features_dataset.py
+│   ├── test_metrics_and_regress.py
 │   ├── test_rays.py
 │   ├── test_generator.py
 │   └── test_pipeline_tiny.py    # 端到端小集成
@@ -311,40 +316,50 @@ def validate_episode(ep: Mapping[str, np.ndarray | str]) -> None  # 形状、dty
 # viz.py
 def viz_episode(episode_path, out_dir, step=0, drone_index=0) -> dict[str, Path]
 
-# features.py
-def cache_features(raw_dir, out_dir, encoder, cfg) -> None   # 幂等；写 manifest.json
-def load_manifest(dir) -> Manifest                           # 不匹配则 raise
+# features.py（通过 PatchEncoder Protocol 接收编码器，不反向依赖 models）
+def feature_cache_dir(feats_dir, cfg: EncoderConfig) -> Path
+def cache_features(raw_dir, out_dir, encoder, cfg, ...) -> dict[str, int]  # 幂等；写 manifest.json
+def load_manifest(cache_dir, expected=None, *, cfg=None) -> Manifest       # 不匹配则 raise
 
 # dataset.py
-@dataclass
+@dataclass(frozen=True)
 class Sample:
     ctx_feats: Tensor | None      # (2, 4, N, C)  步 {t-1, t}，缓存模式
-    ctx_rgb: Tensor | None        # (2, 4, 3, H, W)  在线编码（LoRA）模式
+    ctx_rgb: Tensor | None        # (2, 4, 3, H, W)  [0, 1]，在线编码 / copy_nearest_cam 模式
     ctx_T_tgt: Tensor             # (2, 4, 4, 4)  各上下文相机 → 目标时刻 Base 系 的变换
-    K_ctx: Tensor                 # (3, 3)
+    K_ctx: Tensor                 # (4, 3, 3)  4 路独立内参，已同步缩放到 encoder.res（schema v2）
     tgt_T: Tensor                 # (4, 4)  无人机相机 → 目标时刻 Base 系
     K_tgt: Tensor                 # (3, 3)
-    tgt_rgb: Tensor              # (3, Hd, Wd)  [-1, 1]
-    prev_rgb: Tensor              # (3, Hd, Wd)  同一台无人机的 t-1 图像
-    meta: dict                    # seed, t, m
+    tgt_rgb: Tensor               # (3, Hd, Wd)  [-1, 1]
+    prev_rgb: Tensor              # (3, Hd, Wd)  [-1, 1]，同一台无人机的 t-1 图像
+    meta: dict[str, int]          # seed, t, m
+@dataclass(frozen=True)
+class SampleBatch: ...            # 批维度堆叠容器，含 .to(device) 与形状校验
+def collate_samples(samples) -> SampleBatch
 class EpisodeDataset(torch.utils.data.Dataset): ...
-def make_dataset(cfg, split, use_cache: bool) -> EpisodeDataset
+def make_dataset(cfg, split="train", use_cache: bool = True, ...) -> EpisodeDataset
 ```
-- 位姿换算全部在 `dataset.py` 里用 `geometry` 完成，**模型侧只拿到"已在目标 Base 系下"的变换**。
+- 位姿换算全部在 `dataset.py` 里用 `geometry` 完成，**模型侧只拿到"已在目标 Base 系下"的变换**。`K_ctx` 在加载时通过 `geometry.scale_K` 缩放到 `encoder.res` 像素坐标系，与特征网格一致。
 
 ### 5.4 `models`
 
 ```python
 # encoder.py
 class FrozenEncoder(nn.Module):
-    def encode(self, rgb: Tensor) -> Tensor        # (B,3,H,W) -> (B,N,C)，no_grad
+    @classmethod
+    def from_config(cls, cfg: EncoderConfig, *, local_files_only=None) -> "FrozenEncoder"
+    def preprocess(self, rgb: Tensor) -> Tensor    # (B,3,H,W) [0,1] -> 缩放并按预训练均值/方差归一化
+    def encode(self, rgb: Tensor) -> Tensor        # (B,3,H,W) -> (B,N,C)，no_grad，可选 2×2 池化
     def enable_lora(self, r: int, alpha: int) -> None
-# rays.py
+# regress.py（M2）
+class RegressBaseline(nn.Module):
+    def forward(self, ctx_feats, ctx_T_tgt, tgt_T, K_tgt) -> Tensor   # (B,3,Hd,Wd) [-1,1]
+# rays.py（M3）
 def plucker_rays(K, T_B_C, h, w, patch) -> Tensor  # (N_patch, 6)，patch 中心像素
-# generator.py
+# generator.py（M3）
 class Generator(nn.Module):
     def forward(self, x_t, t, r, ctx, rays_tgt, prev=None) -> Tensor   # x_hat，x-prediction
-# sampler.py
+# sampler.py（M3）
 def sample(gen, cond, steps: int, kind: Literal["fm", "meanflow"], generator=None) -> Tensor
 ```
 
@@ -382,11 +397,14 @@ def run(cfg: Config, stage: str, run_dir: Path, resume: bool, overfit_seed: int 
 
 ```python
 # metrics.py
-def lpips_score(a, b) -> Tensor;  def psnr(a, b) -> Tensor;  def ssim(a, b) -> Tensor
-def baseline_copy_nearest_cam(sample) -> Tensor
-def bucketize(meta, T_tgt) -> dict[str, str]        # 距离/高度/转弯角速度/弹簧臂与遮挡状态
-def measure_latency(gen, cond, steps, device, warmup=10, iters=50) -> dict
-# report.py
+def to_unit_range(images: Tensor) -> Tensor
+def lpips_score(a, b, *, metric=None) -> Tensor;  def psnr(a, b) -> Tensor;  def ssim(a, b) -> Tensor
+def baseline_copy_nearest_cam(sample: Sample) -> Tensor
+def evaluate_copy_nearest_cam(cfg, *, split="val", ...) -> EvalReport
+def evaluate_checkpoint(checkpoint_path, cfg, *, split="val", use_ema=True, ...) -> EvalReport
+def bucketize(meta, T_tgt) -> dict[str, str]        # 距离/高度/转弯角速度/弹簧臂与遮挡状态（M7）
+def measure_latency(gen, cond, steps, device, warmup=10, iters=50) -> dict  # （M5）
+# report.py（M7）
 def build_report(results, out_dir) -> None           # report.json + 对比图
 ```
 
@@ -423,6 +441,9 @@ def build_report(results, out_dir) -> None           # report.json + 对比图
 | 单元 | `schema`：好/坏 episode 的校验结果 | 默认 |
 | 集成 | `record`：tiny episode 确定性、真实 GL 重投影、可见性、禁止 `mj_step`、spawn 多进程 | 默认 |
 | 集成 | `viz`：上下文/无人机/重投影图片导出与下标校验 | 默认 |
+| 单元 | `encoder`：本地小 DINOv3 归一化/缩放/2×2 池化/LoRA 梯度与参数冻结 | 默认 |
+| 单元/集成 | `features_dataset`：特征缓存幂等性、manifest 拒绝不匹配、目标 Base 系位姿换算与内参缩放 | 默认 |
+| 单元/集成 | `metrics_and_regress`：PSNR/SSIM/LPIPS（mock）、`copy_nearest_cam`、regress 训练/resume/评估、依赖边界 | 默认 |
 | 单元 | `rays`：torch 实现与 numpy 参考一致（容差 1e-5） | 默认 |
 | 单元 | `generator`：tiny 配置（CPU）前向/反向、形状、有限性 | 默认 |
 | 集成 | `test_pipeline_tiny`：生成 2 个 episode → 用**假编码器**缓存特征 → 跑 2 个训练步 → 采样 | 默认（不下载大文件） |

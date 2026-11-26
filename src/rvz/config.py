@@ -72,6 +72,13 @@ class EncoderConfig:
     # DINOv3-B（patch16）；HF id 放配置不写死，可用性由 doctor --download 验证。
     id: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     res: int = 128  # 编码器输入分辨率（SPEC §5.1）
+    pool_2x2: bool = False  # 可选 2×2 平均池化（SPEC §5.1）
+
+    def __post_init__(self) -> None:
+        if not self.id.strip():
+            raise ValueError("encoder.id 不能为空")
+        if self.res <= 0:
+            raise ValueError("encoder.res 必须为正整数")
 
 
 @dataclass(frozen=True)
@@ -82,6 +89,14 @@ class ModelConfig:
     patch: int = 8
     p_drop: float = 0.15  # 相机丢弃概率（SPEC §5.3 初值）
 
+    def __post_init__(self) -> None:
+        if self.dim <= 0 or self.depth <= 0 or self.heads <= 0 or self.patch <= 0:
+            raise ValueError("model.dim/depth/heads/patch 必须为正整数")
+        if self.dim % self.heads != 0:
+            raise ValueError("model.dim 必须能被 model.heads 整除")
+        if not 0.0 <= self.p_drop < 1.0:
+            raise ValueError("model.p_drop 必须在 [0, 1) 内")
+
 
 @dataclass(frozen=True)
 class TrainConfig:
@@ -89,6 +104,23 @@ class TrainConfig:
     lr: float = 1e-4  # 初值，首次实测后可修订
     ema: float = 0.999  # FR-TRN-3 初值
     seed: int = 0
+    steps: int = 1000
+    log_every: int = 50
+    save_every: int = 500
+    lpips_weight: float = 0.2  # 感知损失权重 λ（SPEC §6.1）
+    num_workers: int = 0
+
+    def __post_init__(self) -> None:
+        if self.batch <= 0 or self.steps <= 0 or self.log_every <= 0 or self.save_every <= 0:
+            raise ValueError("train.batch/steps/log_every/save_every 必须为正整数")
+        if self.lr <= 0.0:
+            raise ValueError("train.lr 必须为正数")
+        if not 0.0 <= self.ema < 1.0:
+            raise ValueError("train.ema 必须在 [0, 1) 内")
+        if self.lpips_weight < 0.0:
+            raise ValueError("train.lpips_weight 必须非负")
+        if self.num_workers < 0:
+            raise ValueError("train.num_workers 必须非负")
 
 
 @dataclass(frozen=True)
@@ -159,3 +191,8 @@ def load_config(path: str | Path | None = None, overrides: list[str] | None = No
     for item in overrides or []:
         _apply_override(raw, item)
     return _build(Config, raw)
+
+
+def dump_config(cfg: Config) -> str:
+    """把配置序列化为 YAML 快照文本（ARCH §6）。"""
+    return yaml.safe_dump(dataclasses.asdict(cfg), sort_keys=False, allow_unicode=True)
