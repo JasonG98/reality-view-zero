@@ -13,7 +13,7 @@ import pytest
 from rvz.config import SimConfig
 from rvz.data.schema import SCHEMA_VERSION, validate_episode
 from rvz.geometry import intrinsics_from_fovy, invert, project
-from rvz.sim.layout import plan_path, sample_layout
+from rvz.sim.layout import plan_path
 from rvz.sim.record import generate_episode, generate_many, live_camera_frames, marker_centroid
 from rvz.sim.rig import (
     LOOKAT_HEIGHT_OFFSET_M,
@@ -23,28 +23,16 @@ from rvz.sim.rig import (
     robot_poses,
     set_robot_pose,
 )
-from rvz.sim.scene import layout_to_mjcf
+from rvz.sim.scene import build_scene
 
 
 def tiny_config() -> SimConfig:
-    return SimConfig(
-        robot_res=48,
-        drone_res=48,
-        steps=2,
-        n_drones=3,
-        warehouse_min_size=12.0,
-        warehouse_max_size=12.0,
-        min_aisles=3,
-        max_aisles=3,
-        max_resamples=30,
-    )
+    return SimConfig(robot_res=48, drone_res=48, steps=2, n_drones=3, max_resamples=30)
 
 
 def test_mjcf_contains_required_cameras_and_no_ceiling() -> None:
     cfg = tiny_config()
-    layout, colors = sample_layout(0, cfg)
-    xml = layout_to_mjcf(layout, colors, cfg)
-    model = mujoco.MjModel.from_xml_string(xml)
+    layout, model = build_scene(0, cfg)
     assert model.ncam == 4
     assert [model.camera(index).name for index in range(4)] == ["front", "left", "right", "back"]
     assert model.vis.global_.fovy == cfg.fovy_deg
@@ -70,12 +58,12 @@ def test_mjcf_contains_required_cameras_and_no_ceiling() -> None:
     assert model.vis.global_.offwidth >= cfg.drone_res
     assert model.vis.global_.offheight >= cfg.drone_res
     assert all(model.geom(index).name != "ceiling" for index in range(model.ngeom))
-    assert 1 <= len(layout.lights) <= 3
+    assert len(layout.lights) >= 1
 
 
 def test_drone_trajectories_are_strictly_behind() -> None:
     cfg = SimConfig(steps=8)
-    layout, _ = sample_layout(4, cfg)
+    layout, _ = build_scene(4, cfg)
     path = plan_path(layout, np.random.default_rng(4))
     poses = robot_poses(path, cfg.steps, cfg.dt, cfg.robot_speed)
     trajectories = drone_trajectories(np.random.default_rng(8), layout, poses, cfg)
@@ -114,6 +102,13 @@ def test_generate_episode_schema_determinism_and_reprojection(monkeypatch: pytes
     assert meta["max_reprojection_error_px"] <= 2.0
     assert len(meta["drone_resamples"]) == cfg.n_drones
     assert all(0 <= count < cfg.max_resamples for count in meta["drone_resamples"])
+    diagnostics = meta["diagnostics"]
+    assert diagnostics["max_step_yaw_deg"] >= 0.0
+    assert diagnostics["total_yaw_change_deg"] >= diagnostics["max_step_yaw_deg"]
+    assert diagnostics["spring_arm_shortened_steps"] >= 0
+    assert diagnostics["min_drone_distance_m"] >= 0.45
+    assert diagnostics["occlusion_hidden_steps"] >= 0
+    assert diagnostics["total_hidden_geoms"] >= diagnostics["occlusion_hidden_steps"]
     actual_poses = first["T_W_Cdrone"]
     assert np.all((actual_poses[..., 2, 3] >= cfg.drone_height_min) & (actual_poses[..., 2, 3] <= cfg.drone_height_max))
     downward_angles = np.rad2deg(np.arcsin(-actual_poses[..., 2, 2]))
@@ -155,7 +150,7 @@ def test_live_camera_frames_follow_episode_order_and_loop(
 
 
 def test_small_warehouse_renders_at_preview_resolution() -> None:
-    cfg = replace(tiny_config(), scene="small_warehouse", robot_res=512, drone_res=768, n_drones=1)
+    cfg = replace(tiny_config(), robot_res=512, drone_res=768, n_drones=1)
 
     episode = generate_episode(0, cfg)
 
@@ -169,9 +164,9 @@ def test_small_warehouse_renders_at_preview_resolution() -> None:
 
 
 def test_small_warehouse_limits_rear_camera_at_open_shelving() -> None:
-    cfg = replace(tiny_config(), scene="small_warehouse", drone_res=128, n_drones=1, max_resamples=4)
+    cfg = replace(tiny_config(), drone_res=128, n_drones=1, max_resamples=4)
 
-    episode = generate_episode(7, cfg)
+    episode = generate_episode(4, cfg)
 
     lookat = episode["T_W_B"][:, None, :3, 3] + [0.0, 0.0, LOOKAT_HEIGHT_OFFSET_M]
     distances = np.linalg.norm(episode["T_W_Cdrone"][..., :3, 3] - lookat, axis=-1)
@@ -192,25 +187,27 @@ def test_marker_centroid_detects_antialiased_beacon() -> None:
     image = np.zeros((24, 24, 3), dtype=np.uint8)
     image[9:11, 11:13] = [143, 24, 157]
     image[8:16, 14:20] = [190, 100, 190]
+    image[6:9, 6:10] = [164, 74, 213]  # 邻近紫色箱体不应拉偏发光灯标质心。
 
     centroid = marker_centroid(image, np.array([11.5, 9.5]))
 
     np.testing.assert_array_equal(centroid, [11.5, 9.5])
 
 
-def test_seed_13_marker_centroid_rejects_bright_floor() -> None:
-    # 旧阈值把 ep_000013 的亮粉色地面混入标记质心，最大误差曾达 5.175 px。
-    cfg = SimConfig(robot_res=128, drone_res=64, steps=30)
-    episode = generate_episode(13, cfg)
+def test_strict_rear_view_and_spring_arm_diagnostics() -> None:
+    # 贴近货架平滑转弯时须保持严格正后方并平滑缩短弹簧臂，且诊断计数与轨迹一致。
+    cfg = SimConfig(robot_res=128, drone_res=128, steps=40)
+    episode = generate_episode(10008, cfg)
+    validate_episode(episode)
     meta = json.loads(str(episode["meta_json"]))
     assert meta["max_reprojection_error_px"] <= 2.0
-
-
-def test_seed_6_hides_occluder_from_strict_rear_view() -> None:
-    # 正后方机位在第 11 步被货架挡住，必须隐藏遮挡物而不是转向斜后方。
-    episode = generate_episode(6, SimConfig(robot_res=128, drone_res=64, steps=30))
-    meta = json.loads(str(episode["meta_json"]))
-    assert meta["max_reprojection_error_px"] <= 2.0
+    assert meta["diagnostics"]["spring_arm_shortened_steps"] > 0
+    assert meta["diagnostics"]["min_drone_distance_m"] < cfg.drone_distance_min
+    assert meta["diagnostics"]["total_yaw_change_deg"] >= 60.0
+    lookat = episode["T_W_B"][:, None, :3, 3] + np.array([0.0, 0.0, LOOKAT_HEIGHT_OFFSET_M], dtype=np.float32)
+    distances = np.linalg.norm(episode["T_W_Cdrone"][..., :3, 3] - lookat, axis=-1)
+    assert distances.min() < cfg.drone_distance_min
+    assert np.max(np.abs(np.diff(distances, axis=0))) <= 0.120001
     relative_xy = episode["T_W_Cdrone"][..., :2, 3] - episode["T_W_B"][:, None, :2, 3]
     forward_xy = episode["T_W_B"][:, None, :2, 0]
     cross = relative_xy[..., 0] * forward_xy[..., 1] - relative_xy[..., 1] * forward_xy[..., 0]
@@ -219,29 +216,8 @@ def test_seed_6_hides_occluder_from_strict_rear_view() -> None:
     assert np.all(along < 0.0)
 
 
-def test_seed_5_spring_arm_avoids_rear_obstacle() -> None:
-    # 近低机位下固定距离会穿货架，弹簧臂必须提前平滑缩短且保持正后方。
-    cfg = SimConfig(robot_res=128, drone_res=64, steps=30)
-    episode = generate_episode(5, cfg)
-    lookat = episode["T_W_B"][:, None, :3, 3] + np.array([0.0, 0.0, LOOKAT_HEIGHT_OFFSET_M], dtype=np.float32)
-    distances = np.linalg.norm(episode["T_W_Cdrone"][..., :3, 3] - lookat, axis=-1)
-    assert distances.min() < cfg.drone_distance_min
-    assert np.max(np.abs(np.diff(distances, axis=0))) <= 0.120001
-    assert json.loads(str(episode["meta_json"]))["max_reprojection_error_px"] <= 2.0
-
-
 def test_generate_many_uses_independent_workers(tmp_path: Path) -> None:
-    cfg = SimConfig(
-        robot_res=40,
-        drone_res=40,
-        steps=1,
-        n_drones=1,
-        warehouse_min_size=12.0,
-        warehouse_max_size=12.0,
-        min_aisles=3,
-        max_aisles=3,
-        max_resamples=30,
-    )
+    cfg = SimConfig(robot_res=40, drone_res=40, steps=1, n_drones=1, max_resamples=30)
     seeds = [101, 102]
     generate_many(seeds, cfg, tmp_path, workers=2)
     for seed in seeds:

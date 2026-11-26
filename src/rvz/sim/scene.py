@@ -1,4 +1,4 @@
-"""仓库场景与车载相机的 MJCF 组装。"""
+"""AWS RoboMaker 小型仓库资产加载与车载相机 MJCF 组装。"""
 
 import json
 import math
@@ -14,7 +14,7 @@ import numpy as np
 
 from rvz.config import SimConfig
 from rvz.geometry import CAM_ORDER, MARKER_LOCAL, SIDE_CAMERAS
-from rvz.sim.layout import Box, Layout, Light, ProceduralColors, occupied_grid, required_path_length, sample_layout
+from rvz.sim.layout import Box, Layout, Light, occupied_grid, required_path_length, validate_layout
 from rvz.sim.rig import ROBOT_BODY_Z
 
 MIN_OFFSCREEN_BUFFER = 640
@@ -188,62 +188,11 @@ def _with_robot(root: ElementTree.Element, cfg: SimConfig) -> str:
     return ElementTree.tostring(root, encoding="unicode")
 
 
-def layout_to_mjcf(layout: Layout, colors: ProceduralColors, cfg: SimConfig) -> str:
-    """生成含 4 路车体相机、自由相机参数和无天花板仓库的 MJCF。"""
-    sky_top, sky_bottom = _numbers(colors.sky[0]), _numbers(colors.sky[1])
-    floor_dark, floor_light = _numbers(colors.floor[0]), _numbers(colors.floor[1])
-    wall_dark, wall_light = _numbers(colors.wall[0]), _numbers(colors.wall[1])
-    lines = [
-        '<mujoco model="warehouse">',
-        "  <visual>",
-        '    <headlight ambient="0.35 0.35 0.35" diffuse="0.45 0.45 0.45" specular="0.1 0.1 0.1"/>',
-        "  </visual>",
-        "  <asset>",
-        f'    <texture name="sky" type="skybox" builtin="gradient" rgb1="{sky_top}" '
-        f'rgb2="{sky_bottom}" width="128" height="128"/>',
-        f'    <texture name="floor_texture" type="2d" builtin="checker" rgb1="{floor_dark}" '
-        f'rgb2="{floor_light}" width="128" height="128"/>',
-        '    <material name="floor_material" texture="floor_texture" texrepeat="8 8"/>',
-        f'    <texture name="wall_texture" type="cube" builtin="checker" rgb1="{wall_dark}" '
-        f'rgb2="{wall_light}" width="64" height="64"/>',
-        '    <material name="wall_material" texture="wall_texture"/>',
-        '    <texture name="box_texture" type="cube" builtin="checker" '
-        'rgb1="0.95 0.95 0.95" rgb2="0.55 0.55 0.55" width="32" height="32"/>',
-    ]
-    for box in layout.boxes:
-        if box.kind != "wall":
-            lines.append(f'    <material name="mat_{box.name}" texture="box_texture" rgba="{_numbers(box.rgba)}"/>')
-    lines.extend(
-        [
-            "  </asset>",
-            "  <worldbody>",
-            f'    <geom name="floor" type="plane" pos="0 0 0" '
-            f'size="{layout.width / 2.0:.6g} {layout.depth / 2.0:.6g} 0.1" '
-            'material="floor_material" contype="0" conaffinity="0"/>',
-        ]
-    )
-    for index, light in enumerate(layout.lights):
-        lines.append(
-            f'    <light name="light_{index}" pos="{_numbers(light.position)}" '
-            f'dir="{_numbers(light.direction)}" diffuse="{_numbers(light.diffuse)}"/>'
-        )
-    for box in layout.boxes:
-        material = "wall_material" if box.kind == "wall" else f"mat_{box.name}"
-        lines.append(
-            f'    <geom name="{box.name}" type="box" pos="{_numbers(box.center)}" '
-            f'size="{_numbers(box.size / 2.0)}" material="{material}" contype="0" conaffinity="0"/>'
-        )
-    lines.extend(["  </worldbody>", "</mujoco>"])
-    return _with_robot(ElementTree.fromstring("\n".join(lines)), cfg)
-
-
 def build_scene(seed: int, cfg: SimConfig) -> tuple[Layout, mujoco.MjModel]:
-    """按 cfg.scene 构造布局与 MJCF 模型。"""
-    if cfg.scene == "small_warehouse":
-        template, model = _warehouse_template(cfg)
-        return replace(template, seed=seed), model
-    layout, colors = sample_layout(seed, cfg)
-    return layout, mujoco.MjModel.from_xml_string(layout_to_mjcf(layout, colors, cfg))
+    """加载小型仓库布局与 MJCF 模型（按 cfg 缓存，seed 用于下游路径与机位采样）。"""
+    assert cfg.scene == "small_warehouse"
+    template, model = _warehouse_template(cfg)
+    return replace(template, seed=seed), model
 
 
 @cache
@@ -297,4 +246,5 @@ def _warehouse_template(cfg: SimConfig) -> tuple[Layout, mujoco.MjModel]:
         occupied=occupied_grid(width, depth, cfg.grid_resolution, clearance, boxes),
         min_path_length=required_path_length(cfg),
     )
+    validate_layout(layout)
     return layout, model

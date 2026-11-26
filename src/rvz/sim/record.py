@@ -60,6 +60,23 @@ class _EpisodeScene:
     drone_scene_option: mujoco.MjvOption
 
 
+@dataclass(frozen=True)
+class _DroneDiagnostics:
+    max_reprojection_error_px: float
+    spring_arm_shortened_steps: int
+    min_distance_m: float
+    occlusion_hidden_steps: int
+    total_hidden_geoms: int
+
+
+def _yaw_diagnostics_deg(robot_world_poses: np.ndarray) -> tuple[float, float]:
+    if len(robot_world_poses) < 2:
+        return 0.0, 0.0
+    yaws = np.arctan2(robot_world_poses[:, 1, 0], robot_world_poses[:, 0, 0]).astype(np.float64)
+    dyaws = np.abs(np.arctan2(np.sin(np.diff(yaws)), np.cos(np.diff(yaws))))
+    return float(np.rad2deg(dyaws.max())), float(np.rad2deg(dyaws.sum()))
+
+
 def _make_episode_scene(seed: int, cfg: SimConfig) -> _EpisodeScene:
     layout, model = build_scene(seed, cfg)
     path = plan_path(layout, np.random.default_rng(seed + _PATH_SEED_OFFSET))
@@ -83,10 +100,10 @@ def marker_centroid(image: np.ndarray, expected_uv: np.ndarray, marker_radius_px
     start_x, stop_x = max(0, math.floor(x - radius)), min(image.shape[1], math.ceil(x + radius) + 1)
     start_y, stop_y = max(0, math.floor(y - radius)), min(image.shape[0], math.ceil(y + radius) + 1)
     rgb = image[start_y:stop_y, start_x:stop_x]
-    # 小尺寸画面中的灯标可能只有部分像素覆盖，保留与周围明显不同的品红色。
+    # 发光品红灯标具有极低绿色通道占比，排除紫色箱体与偏粉地面的干扰。
     magenta = np.minimum(rgb[..., 0], rgb[..., 2]).astype(np.int16)
-    green = rgb[..., 1]
-    mask = (magenta > 120) & (green < 80) & (magenta - green > 64)
+    green = rgb[..., 1].astype(np.int16)
+    mask = (magenta > 120) & (green < 80) & (magenta - green > 96) & (green * 3 < magenta)
     ys, xs = np.nonzero(mask)
     if len(xs) == 0:
         return None
@@ -135,9 +152,10 @@ def _render_robot_frame(scene: _EpisodeScene, renderer: mujoco.Renderer, robot_r
 
 def _fit_drone_trajectory(
     scene: _EpisodeScene, renderer: mujoco.Renderer, trajectory: DroneTrajectory
-) -> DroneTrajectory | None:
+) -> tuple[DroneTrajectory, int] | None:
     """双向限幅使无人机在遇到障碍前便开始平滑缩短跟随距离。"""
-    distances = trajectory.distance.astype(np.float64).copy()
+    nominal = trajectory.distance.astype(np.float64)
+    distances = nominal.copy()
     robot_body_id = scene.model.body("robot").id
     for step, T_W_B in enumerate(scene.robot_world_poses):
         set_robot_pose(scene.model, scene.simulation, T_W_B)
@@ -159,7 +177,8 @@ def _fit_drone_trajectory(
         distances[step] = min(distances[step], distances[step - 1] + _MAX_DISTANCE_STEP_M)
     for step in range(len(distances) - 2, -1, -1):
         distances[step] = min(distances[step], distances[step + 1] + _MAX_DISTANCE_STEP_M)
-    return replace(trajectory, distance=distances)
+    shortened_steps = int(np.sum(distances < nominal - 1e-6))
+    return replace(trajectory, distance=distances), shortened_steps
 
 
 def _render_drone_frame(
@@ -168,8 +187,8 @@ def _render_drone_frame(
     camera: mujoco.MjvCamera,
     T_W_B: np.ndarray,
     marker_world_position: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """遮挡物只对本次无人机渲染隐藏。"""
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """遮挡物只对本次无人机渲染隐藏，同时返回隐藏几何体数量。"""
     renderer.update_scene(scene.simulation, camera=camera)
     position = read_gl_camera(renderer)[0]
     targets = np.asarray([marker_world_position, T_W_B[:3, 3] + [0.0, 0.0, LOOKAT_HEIGHT_OFFSET_M]])
@@ -184,7 +203,7 @@ def _render_drone_frame(
     finally:
         for geom_id, group in original_groups.items():
             scene.model.geom_group[geom_id] = group
-    return image, T_W_C
+    return image, T_W_C, len(occluders)
 
 
 def _validate_drone_frame(
@@ -225,18 +244,28 @@ def _render_drone(
     K_drone: np.ndarray,
     cfg: SimConfig,
     drone_buffers: tuple[np.ndarray, np.ndarray] | None,
-) -> tuple[DroneTrajectory, float] | None:
-    trajectory = _fit_drone_trajectory(scene, renderer, trajectory)
-    if trajectory is None:
+) -> tuple[DroneTrajectory, _DroneDiagnostics] | None:
+    fitted = _fit_drone_trajectory(scene, renderer, trajectory)
+    if fitted is None:
         logger.debug("无人机 %d 正后方没有足够近的安全机位", drone_index)
         return None
+    trajectory, shortened_steps = fitted
 
     max_error = 0.0
+    occlusion_hidden_steps = 0
+    total_hidden_geoms = 0
     for step, T_W_B in enumerate(scene.robot_world_poses):
         set_robot_pose(scene.model, scene.simulation, T_W_B)
         marker_position = marker_world(T_W_B)
-        frame = _render_drone_frame(scene, renderer, trajectory.camera(step), T_W_B, marker_position)
-        image, T_W_C, reprojection_error = _validate_drone_frame(frame, scene, K_drone, T_W_B, marker_position, cfg)
+        image, T_W_C, hidden_count = _render_drone_frame(
+            scene, renderer, trajectory.camera(step), T_W_B, marker_position
+        )
+        if hidden_count > 0:
+            occlusion_hidden_steps += 1
+            total_hidden_geoms += hidden_count
+        image, T_W_C, reprojection_error = _validate_drone_frame(
+            (image, T_W_C), scene, K_drone, T_W_B, marker_position, cfg
+        )
         if reprojection_error is None:
             logger.debug("无人机 %d 第 %d 步校验失败", drone_index, step)
             return None
@@ -245,7 +274,14 @@ def _render_drone(
             images, poses = drone_buffers
             images[step] = image
             poses[step] = T_W_C
-    return trajectory, max_error
+    diagnostics = _DroneDiagnostics(
+        max_reprojection_error_px=max_error,
+        spring_arm_shortened_steps=shortened_steps,
+        min_distance_m=float(trajectory.distance.min()),
+        occlusion_hidden_steps=occlusion_hidden_steps,
+        total_hidden_geoms=total_hidden_geoms,
+    )
+    return trajectory, diagnostics
 
 
 def _validated_drone_trajectories(
@@ -256,7 +292,7 @@ def _validated_drone_trajectories(
     cfg: SimConfig,
     *,
     episode_buffers: tuple[np.ndarray, np.ndarray] | None = None,
-) -> Generator[tuple[DroneTrajectory, int, float], None, None]:
+) -> Generator[tuple[DroneTrajectory, int, _DroneDiagnostics], None, None]:
     rng = np.random.default_rng(seed + _DRONE_SEED_OFFSET)
     trajectories = drone_trajectories(rng, scene.layout, scene.robot_world_poses, cfg)
     for drone_index in range(cfg.n_drones):
@@ -271,8 +307,8 @@ def _validated_drone_trajectories(
                 trajectories = drone_trajectories(rng, scene.layout, scene.robot_world_poses, cfg)
             result = _render_drone(drone_index, trajectories[drone_index], scene, renderer, K_drone, cfg, drone_buffers)
             if result is not None:
-                trajectory, max_error = result
-                yield trajectory, attempt, max_error
+                trajectory, diagnostics = result
+                yield trajectory, attempt, diagnostics
                 break
         else:
             raise RuntimeError(f"无人机 {drone_index} 重采样 {cfg.max_resamples} 次后仍无有效轨迹")
@@ -294,7 +330,7 @@ def generate_episode(seed: int, cfg: SimConfig) -> dict[str, np.ndarray | str]:
     drone_rgb = np.empty((cfg.steps, cfg.n_drones, cfg.drone_res, cfg.drone_res, 3), dtype=np.uint8)
     drone_poses = np.empty((cfg.steps, cfg.n_drones, 4, 4), dtype=np.float32)
     resamples: list[int] = []
-    max_reprojection_error = 0.0
+    drone_diagnostics: list[_DroneDiagnostics] = []
     with (
         mujoco.Renderer(scene.model, cfg.robot_res, cfg.robot_res) as robot_renderer,
         mujoco.Renderer(scene.model, cfg.drone_res, cfg.drone_res) as drone_renderer,
@@ -304,12 +340,14 @@ def generate_episode(seed: int, cfg: SimConfig) -> dict[str, np.ndarray | str]:
         for step, T_W_B in enumerate(scene.robot_world_poses):
             set_robot_pose(scene.model, scene.simulation, T_W_B)
             _render_robot_frame(scene, robot_renderer, robot_rgb[step])
-        for _, attempt, drone_error in _validated_drone_trajectories(
+        for _, attempt, diagnostics in _validated_drone_trajectories(
             seed, scene, drone_renderer, K_drone, cfg, episode_buffers=(drone_rgb, drone_poses)
         ):
             resamples.append(attempt)
-            max_reprojection_error = max(max_reprojection_error, drone_error)
+            drone_diagnostics.append(diagnostics)
 
+    max_reprojection_error = max(d.max_reprojection_error_px for d in drone_diagnostics)
+    max_step_yaw_deg, total_yaw_change_deg = _yaw_diagnostics_deg(scene.robot_world_poses)
     meta = {
         "schema_version": SCHEMA_VERSION,
         "seed": seed,
@@ -327,6 +365,14 @@ def generate_episode(seed: int, cfg: SimConfig) -> dict[str, np.ndarray | str]:
         },
         "drone_resamples": resamples,
         "max_reprojection_error_px": max_reprojection_error,
+        "diagnostics": {
+            "max_step_yaw_deg": max_step_yaw_deg,
+            "total_yaw_change_deg": total_yaw_change_deg,
+            "spring_arm_shortened_steps": sum(d.spring_arm_shortened_steps for d in drone_diagnostics),
+            "min_drone_distance_m": min(d.min_distance_m for d in drone_diagnostics),
+            "occlusion_hidden_steps": sum(d.occlusion_hidden_steps for d in drone_diagnostics),
+            "total_hidden_geoms": sum(d.total_hidden_geoms for d in drone_diagnostics),
+        },
     }
     episode: dict[str, np.ndarray | str] = {
         "robot_rgb": robot_rgb,
@@ -366,7 +412,7 @@ def live_camera_frames(
                 robot_rgb = np.empty((len(CAM_ORDER), cfg.robot_res, cfg.robot_res, 3), dtype=np.uint8)
                 _render_robot_frame(scene, robot_renderer, robot_rgb)
                 marker_position = marker_world(T_W_B)
-                drone_rgb, _ = _render_drone_frame(
+                drone_rgb, _, _ = _render_drone_frame(
                     scene, drone_renderer, trajectory.camera(step), T_W_B, marker_position
                 )
                 yield robot_rgb, drone_rgb

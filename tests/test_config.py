@@ -11,6 +11,7 @@ from rvz.config import Config, SimConfig, load_config
 def test_defaults_construct_without_file() -> None:
     cfg = load_config()
     assert cfg == Config()
+    assert cfg.sim.scene == "small_warehouse"
     assert cfg.sim.n_drones == 3
     assert cfg.eval.steps == [1, 2, 4, 50]
 
@@ -54,8 +55,8 @@ def test_config_is_frozen() -> None:
 
 
 def test_invalid_sim_ranges_rejected() -> None:
-    with pytest.raises(ValueError, match="通道数范围"):
-        SimConfig(max_aisles=7)
+    with pytest.raises(ValueError, match="未知场景"):
+        SimConfig(scene="procedural")  # type: ignore[arg-type]  # 故意验证非法场景拒绝
     with pytest.raises(ValueError, match="无人机距离范围"):
         SimConfig(drone_distance_min=4.0, drone_distance_max=2.0)
     with pytest.raises(ValueError, match="robot_side_fovy_deg"):

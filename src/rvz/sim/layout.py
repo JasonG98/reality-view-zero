@@ -1,4 +1,4 @@
-"""确定性仓库布局、AABB 占用栅格与 A* 路径。"""
+"""仓库包围盒布局、AABB 占用栅格与平滑 A* 路径。"""
 
 import heapq
 from dataclasses import dataclass
@@ -8,22 +8,10 @@ import numpy as np
 
 from rvz.config import SimConfig
 
-_PALETTE = np.array(
-    [
-        [0.80, 0.35, 0.10],
-        [0.15, 0.45, 0.80],
-        [0.20, 0.65, 0.30],
-        [0.85, 0.70, 0.15],
-        [0.75, 0.20, 0.15],
-        [0.55, 0.30, 0.70],
-    ],
-    dtype=np.float32,
-)
-
 
 @dataclass(frozen=True)
 class Box:
-    """轴对齐基本体；center/size 均为全尺寸米制，z 从底面支撑关系校验。"""
+    """轴对齐基本体；center/size 均为全尺寸米制。"""
 
     name: str
     kind: str
@@ -52,24 +40,6 @@ class Layout:
     min_path_length: float
 
 
-@dataclass(frozen=True)
-class ProceduralColors:
-    wall: np.ndarray
-    floor: np.ndarray
-    sky: np.ndarray
-
-
-def _color(rng: np.random.Generator) -> np.ndarray:
-    color = _PALETTE[rng.integers(len(_PALETTE))] + rng.uniform(-0.04, 0.04, 3)
-    return np.concatenate([np.clip(color, 0.05, 0.95), [1.0]]).astype(np.float32)
-
-
-def _overlaps(first: Box, second: Box) -> bool:
-    first_min, first_max = first.center - first.size / 2.0, first.center + first.size / 2.0
-    second_min, second_max = second.center - second.size / 2.0, second.center + second.size / 2.0
-    return bool(np.all(np.minimum(first_max, second_max) - np.maximum(first_min, second_min) > 1e-5))
-
-
 def required_path_length(cfg: SimConfig) -> float:
     """小车走完 cfg.steps 步所需的最短路径长度。"""
     return (cfg.steps - 1) * cfg.robot_speed * cfg.dt
@@ -93,176 +63,47 @@ def occupied_grid(
     return occupied
 
 
-def _free_box(
-    rng: np.random.Generator,
-    width: float,
-    depth: float,
-    boxes: list[Box],
-    name: str,
-    kind: str,
-    size: np.ndarray,
-) -> Box | None:
-    for _ in range(100):
-        margin = 0.55
-        center = np.array(
-            [
-                rng.uniform(-width / 2.0 + margin + size[0] / 2.0, width / 2.0 - margin - size[0] / 2.0),
-                rng.uniform(-depth / 2.0 + margin + size[1] / 2.0, depth / 2.0 - margin - size[1] / 2.0),
-                size[2] / 2.0,
-            ],
-            dtype=np.float32,
-        )
-        candidate = Box(name, kind, center, size.astype(np.float32), _color(rng))
-        if not any(_overlaps(candidate, box) for box in boxes):
-            return candidate
-    return None
-
-
-def sample_layout(seed: int, cfg: SimConfig) -> tuple[Layout, ProceduralColors]:
-    """由 seed 确定性生成程序化仓库布局和纹理颜色。"""
-    rng = np.random.default_rng(seed)
-    width = float(rng.uniform(cfg.warehouse_min_size, cfg.warehouse_max_size))
-    depth = float(rng.uniform(cfg.warehouse_min_size, cfg.warehouse_max_size))
-    n_aisles = int(rng.integers(cfg.min_aisles, cfg.max_aisles + 1))
-    colors = ProceduralColors(
-        wall=rng.uniform(0.25, 0.75, (2, 3)).astype(np.float32),
-        floor=rng.uniform(0.20, 0.65, (2, 3)).astype(np.float32),
-        sky=rng.uniform(0.30, 0.85, (2, 3)).astype(np.float32),
-    )
-    boxes: list[Box] = []
-    wall_specs = [
-        ("wall_north", (0.0, depth / 2.0 - 0.1, 1.0), (width, 0.2, 2.0)),
-        ("wall_south", (0.0, -depth / 2.0 + 0.1, 1.0), (width, 0.2, 2.0)),
-        ("wall_east", (width / 2.0 - 0.1, 0.0, 1.0), (0.2, depth - 0.4, 2.0)),
-        ("wall_west", (-width / 2.0 + 0.1, 0.0, 1.0), (0.2, depth - 0.4, 2.0)),
-    ]
-    for name, center, size in wall_specs:
-        boxes.append(
-            Box(
-                name,
-                "wall",
-                np.array(center, dtype=np.float32),
-                np.array(size, dtype=np.float32),
-                np.ones(4, dtype=np.float32),
-            )
-        )
-
-    shelf_count = n_aisles - 1
-    shelf_ys = np.linspace(-depth / 2.0 + 1.5, depth / 2.0 - 1.5, shelf_count)
-    for shelf_index, shelf_y in enumerate(shelf_ys):
-        shelf_size = np.array([width * rng.uniform(0.45, 0.65), rng.uniform(0.55, 0.75), rng.uniform(1.2, 1.6)])
-        shelf_center = np.array([width * rng.uniform(-0.08, 0.08), shelf_y, shelf_size[2] / 2.0])
-        shelf = Box(
-            f"shelf_{shelf_index}", "shelf", shelf_center.astype(np.float32), shelf_size.astype(np.float32), _color(rng)
-        )
-        boxes.append(shelf)
-        for stack_index in range(int(rng.integers(1, 4))):
-            stack_size = np.array([rng.uniform(0.25, 0.45), rng.uniform(0.25, 0.40), rng.uniform(0.25, 0.50)])
-            for _ in range(30):
-                stack_center = np.array(
-                    [
-                        rng.uniform(
-                            shelf_center[0] - shelf_size[0] / 2.0 + stack_size[0] / 2.0,
-                            shelf_center[0] + shelf_size[0] / 2.0 - stack_size[0] / 2.0,
-                        ),
-                        rng.uniform(
-                            shelf_center[1] - shelf_size[1] / 2.0 + stack_size[1] / 2.0,
-                            shelf_center[1] + shelf_size[1] / 2.0 - stack_size[1] / 2.0,
-                        ),
-                        shelf_size[2] + stack_size[2] / 2.0,
-                    ],
-                    dtype=np.float32,
-                )
-                candidate = Box(
-                    f"shelf_box_{shelf_index}_{stack_index}",
-                    "carton",
-                    stack_center,
-                    stack_size.astype(np.float32),
-                    _color(rng),
-                )
-                if not any(_overlaps(candidate, box) for box in boxes):
-                    boxes.append(candidate)
-                    break
-
-    object_counts = (("carton", 5 + n_aisles), ("pallet", 2), ("obstacle", 3))
-    for kind, count in object_counts:
-        for index in range(count):
-            if kind == "pallet":
-                size = np.array([rng.uniform(0.7, 1.0), rng.uniform(0.6, 0.9), 0.12])
-            elif kind == "carton":
-                size = rng.uniform(0.25, 0.60, 3)
-            else:
-                size = rng.uniform(0.20, 0.50, 3)
-            candidate = _free_box(rng, width, depth, boxes, f"{kind}_{index}", kind, size)
-            if candidate is not None:
-                boxes.append(candidate)
-
-    lights = []
-    for _ in range(int(rng.integers(1, 4))):
-        position = np.array(
-            [rng.uniform(-width / 3.0, width / 3.0), rng.uniform(-depth / 3.0, depth / 3.0), rng.uniform(4.5, 6.5)],
-            dtype=np.float32,
-        )
-        direction = -position / np.linalg.norm(position)
-        diffuse = rng.uniform(0.65, 1.0, 3).astype(np.float32)
-        lights.append(Light(position, direction.astype(np.float32), diffuse))
-    occupied = occupied_grid(width, depth, cfg.grid_resolution, cfg.robot_radius, tuple(boxes))
-    layout = Layout(
-        seed=seed,
-        width=width,
-        depth=depth,
-        boxes=tuple(boxes),
-        lights=tuple(lights),
-        grid_resolution=cfg.grid_resolution,
-        robot_radius=cfg.robot_radius,
-        occupied=occupied,
-        min_path_length=required_path_length(cfg),
-    )
-    validate_layout(layout)
-    return layout, colors
-
-
 def validate_layout(layout: Layout) -> None:
-    """检查几何边界、正体积重叠、支撑关系和占用栅格一致性。"""
+    """检查几何体有效性、空闲栅格一致性与可导航性。"""
     names = [box.name for box in layout.boxes]
     if len(names) != len(set(names)):
         raise ValueError("布局几何体名称不唯一")
-    for index, box in enumerate(layout.boxes):
-        if np.any(box.size <= 0.0) or not np.all(np.isfinite(box.center)):
+    if layout.width <= 0.0 or layout.depth <= 0.0:
+        raise ValueError("仓库尺寸必须为正")
+    for box in layout.boxes:
+        if np.any(box.size <= 0.0) or not np.all(np.isfinite(box.center)) or not np.all(np.isfinite(box.size)):
             raise ValueError(f"{box.name} 的尺寸或中心无效")
-        low, high = box.center - box.size / 2.0, box.center + box.size / 2.0
-        if low[0] < -layout.width / 2.0 - 1e-4 or high[0] > layout.width / 2.0 + 1e-4:
-            raise ValueError(f"{box.name} 超出仓库宽度")
-        if low[1] < -layout.depth / 2.0 - 1e-4 or high[1] > layout.depth / 2.0 + 1e-4:
-            raise ValueError(f"{box.name} 超出仓库深度")
-        if abs(low[2]) > 1e-4:
-            supported = False
-            for other in layout.boxes:
-                other_top = other.center[2] + other.size[2] / 2.0
-                horizontal_support = np.all(
-                    np.minimum(high[:2], other.center[:2] + other.size[:2] / 2.0)
-                    - np.maximum(low[:2], other.center[:2] - other.size[:2] / 2.0)
-                    > 0.0
-                )
-                if abs(other_top - low[2]) < 1e-4 and horizontal_support:
-                    supported = True
-                    break
-            if not supported:
-                raise ValueError(f"{box.name} 悬空")
-        for other in layout.boxes[index + 1 :]:
-            if _overlaps(box, other):
-                raise ValueError(f"几何体重叠：{box.name} 与 {other.name}")
     expected = occupied_grid(layout.width, layout.depth, layout.grid_resolution, layout.robot_radius, layout.boxes)
     if not np.array_equal(layout.occupied, expected):
         raise ValueError("空闲栅格与几何体 AABB 不一致")
+    if int((~layout.occupied).sum()) < 2:
+        raise ValueError("布局没有足够的空闲栅格")
+
+
+_SQRT2 = float(np.sqrt(2.0))
+_MIN_START_REAR_CLEARANCE_M = 0.68
+_REAR_CLEARANCE_MARGIN_M = 0.06
+_REAR_OBSTACLE_MIN_TOP_M = 0.20
+_ASTAR_DIRS = (
+    (0, 1, 1.0),
+    (1, 0, 1.0),
+    (0, -1, 1.0),
+    (-1, 0, 1.0),
+    (1, 1, _SQRT2),
+    (1, -1, _SQRT2),
+    (-1, 1, _SQRT2),
+    (-1, -1, _SQRT2),
+)
 
 
 def _astar(layout: Layout, start: tuple[int, int], goal: tuple[int, int]) -> list[tuple[int, int]] | None:
+    """8 邻接 A*（禁止斜穿障碍物角点）。"""
     occupied = layout.occupied
     if occupied[start] or occupied[goal]:
         return None
-    frontier = [(0, 0, start)]
-    costs = {start: 0}
+    rows, cols = occupied.shape
+    frontier: list[tuple[float, float, tuple[int, int]]] = [(0.0, 0.0, start)]
+    costs = {start: 0.0}
     parents: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
     while frontier:
         _, cost, current = heapq.heappop(frontier)
@@ -273,21 +114,24 @@ def _astar(layout: Layout, start: tuple[int, int], goal: tuple[int, int]) -> lis
                 path.append(cursor)
                 cursor = parents[cursor]
             return path[::-1]
-        if cost != costs[current]:
+        if cost > costs[current] + 1e-9:
             continue
-        for dy, dx in ((0, 1), (1, 0), (0, -1), (-1, 0)):
-            neighbor = (current[0] + dy, current[1] + dx)
-            if not (0 <= neighbor[0] < occupied.shape[0] and 0 <= neighbor[1] < occupied.shape[1]):
+        row, col = current
+        for dy, dx, step_cost in _ASTAR_DIRS:
+            next_row, next_col = row + dy, col + dx
+            if not (0 <= next_row < rows and 0 <= next_col < cols) or occupied[next_row, next_col]:
                 continue
-            if occupied[neighbor]:
+            if dy != 0 and dx != 0 and (occupied[row + dy, col] or occupied[row, col + dx]):
                 continue
-            new_cost = cost + 1
-            if new_cost >= costs.get(neighbor, 1 << 30):
+            new_cost = cost + step_cost
+            neighbor = (next_row, next_col)
+            if new_cost >= costs.get(neighbor, 1e18):
                 continue
             costs[neighbor] = new_cost
             parents[neighbor] = current
-            priority = new_cost + abs(goal[0] - neighbor[0]) + abs(goal[1] - neighbor[1])
-            heapq.heappush(frontier, (priority, new_cost, neighbor))
+            dr, dc = abs(goal[0] - next_row), abs(goal[1] - next_col)
+            heuristic = max(dr, dc) + (_SQRT2 - 1.0) * min(dr, dc)
+            heapq.heappush(frontier, (new_cost + heuristic, new_cost, neighbor))
     return None
 
 
@@ -300,35 +144,168 @@ def _cell_world(layout: Layout, cell: tuple[int, int]) -> np.ndarray:
     )
 
 
+def _shortcut_segment(layout: Layout, points: np.ndarray) -> np.ndarray:
+    """用视线剪枝消除栅格锯齿，只保留必要的绕障折点。"""
+    simplified = [points[0]]
+    index = 0
+    count = len(points)
+    while index < count - 1:
+        far = count - 1
+        while far > index + 1:
+            if path_is_free(layout, np.vstack([points[index], points[far]]).astype(np.float32)):
+                break
+            far -= 1
+        simplified.append(points[far])
+        index = far
+    return np.asarray(simplified, dtype=np.float64)
+
+
+def _arc_is_free(layout: Layout, arc: np.ndarray) -> bool:
+    arc_f32 = arc.astype(np.float32)
+    if not path_is_free(layout, arc_f32):
+        return False
+    # 同步检查跨步弦，避免后续等距采样在贴障弯道处擦角穿格。
+    for stride in (2, 4):
+        sub = arc_f32[::stride]
+        if len(sub) >= 2 and not path_is_free(layout, sub):
+            return False
+    return path_is_free(layout, np.vstack([arc_f32[0], arc_f32[len(arc_f32) // 2], arc_f32[-1]]))
+
+
+def _smooth_path(layout: Layout, vertices: np.ndarray) -> np.ndarray:
+    """用无碰撞二次 Bézier 圆角平滑折线转角，消除 90°/180° 航向跳变。"""
+    deduped = [vertices[0]]
+    for point in vertices[1:]:
+        if np.linalg.norm(point - deduped[-1]) >= 1e-5:
+            deduped.append(point)
+    if len(deduped) <= 2:
+        return np.asarray(deduped, dtype=np.float32)
+
+    pts = np.asarray(deduped, dtype=np.float64)
+    out = [pts[0]]
+    for idx in range(1, len(pts) - 1):
+        prev_pt, cur_pt, next_pt = pts[idx - 1], pts[idx], pts[idx + 1]
+        vec_in, vec_out = cur_pt - prev_pt, next_pt - cur_pt
+        len_in, len_out = float(np.linalg.norm(vec_in)), float(np.linalg.norm(vec_out))
+        if len_in < 1e-5 or len_out < 1e-5:
+            continue
+        dir_in, dir_out = vec_in / len_in, vec_out / len_out
+        if float(np.clip(np.dot(dir_in, dir_out), -1.0, 1.0)) > 0.9985:
+            out.append(cur_pt)
+            continue
+        max_offset = min(0.45 * len_in, 0.45 * len_out, 0.75)
+        placed = False
+        for scale in (1.0, 0.7, 0.45, 0.25):
+            offset = max_offset * scale
+            if offset < 0.12:
+                continue
+            start_pt = cur_pt - offset * dir_in
+            end_pt = cur_pt + offset * dir_out
+            ts = np.linspace(0.0, 1.0, max(9, int(np.ceil(2.0 * offset / 0.025)) + 1))[:, None]
+            arc = (1.0 - ts) ** 2 * start_pt + 2.0 * (1.0 - ts) * ts * cur_pt + ts**2 * end_pt
+            if _arc_is_free(layout, arc):
+                out.extend(arc)
+                placed = True
+                break
+        if not placed:
+            out.append(cur_pt)
+    out.append(pts[-1])
+
+    compact = [out[0]]
+    for point in out[1:]:
+        if np.linalg.norm(point - compact[-1]) > 1e-4:
+            compact.append(point)
+    return np.asarray(compact, dtype=np.float32)
+
+
+def _path_length(path: np.ndarray) -> float:
+    return float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()) if len(path) >= 2 else 0.0
+
+
+def _max_turn_rad(path: np.ndarray) -> float:
+    if len(path) < 3:
+        return 0.0
+    segs = np.diff(path.astype(np.float64), axis=0)
+    norms = np.linalg.norm(segs, axis=1, keepdims=True)
+    dirs = segs / np.maximum(norms, 1e-12)
+    dots = np.clip(np.sum(dirs[:-1] * dirs[1:], axis=1), -1.0, 1.0)
+    return float(np.arccos(dots).max())
+
+
+def _rear_clearance_ok(layout: Layout, origin: np.ndarray, heading: np.ndarray) -> bool:
+    """确保起点正后方留有足够空间，避免低机位跟拍相机在首步被墙或货架逼出视野。"""
+    samples = origin[None, :] - np.linspace(0.0, _MIN_START_REAR_CLEARANCE_M, 12)[:, None] * heading[None, :]
+    for box in layout.boxes:
+        if float(box.center[2] + box.size[2] / 2.0) <= _REAR_OBSTACLE_MIN_TOP_M:
+            continue
+        half_xy = box.size[:2] / 2.0 + _REAR_CLEARANCE_MARGIN_M
+        if bool(np.all(np.abs(samples - box.center[:2]) <= half_xy, axis=1).any()):
+            return False
+    return True
+
+
 def plan_path(layout: Layout, rng: np.random.Generator) -> np.ndarray:
-    """随机选点并用 4 邻接 A* 连接，返回总长足够的米制路径 (K,2)。"""
+    """用 8 邻接 A* + 视线剪枝 + 圆角平滑生成无碰撞、无突兀折返的米制路径 (K,2)。"""
     free_cells = np.argwhere(~layout.occupied)
     if len(free_cells) < 2:
         raise ValueError("布局没有足够的空闲栅格")
-    start = tuple(int(v) for v in free_cells[rng.integers(len(free_cells))])
-    world_path = [_cell_world(layout, start)]
-    total_length = 0.0
+    min_seg = min(0.65, layout.min_path_length)
     for _ in range(12):
-        if total_length >= layout.min_path_length:
-            return np.asarray(world_path, dtype=np.float32)
-        for _ in range(200):
-            goal = tuple(int(v) for v in free_cells[rng.integers(len(free_cells))])
-            cells = _astar(layout, start, goal)
-            if cells is None or len(cells) < 2:
-                continue
-            segment = np.asarray([_cell_world(layout, cell) for cell in cells])
-            segment_length = float(np.linalg.norm(np.diff(segment, axis=0), axis=1).sum())
-            if segment_length < min(2.0, layout.min_path_length):
-                continue
-            world_path.extend(segment[1:])
-            total_length += segment_length
-            start = goal
-            break
+        start = tuple(int(v) for v in free_cells[rng.integers(len(free_cells))])
+        vertices = [_cell_world(layout, start)]
+        prev_dir: np.ndarray | None = None
+        for hop in range(24):
+            smoothed = _smooth_path(layout, np.asarray(vertices))
+            if _path_length(smoothed) >= layout.min_path_length + 0.05 and path_is_free(layout, smoothed):
+                return smoothed
+            for attempt in range(200):
+                goal = tuple(int(v) for v in free_cells[rng.integers(len(free_cells))])
+                dist = float(np.linalg.norm(_cell_world(layout, goal) - vertices[-1]))
+                if layout.min_path_length >= 1.2 and attempt < 90:
+                    if hop == 0 and not (0.7 <= dist <= 1.35):
+                        continue
+                    if 0 < hop < 4 and not (0.8 <= dist <= 2.2):
+                        continue
+                cells = _astar(layout, start, goal)
+                if cells is None or len(cells) < 2:
+                    continue
+                segment = _shortcut_segment(layout, np.asarray([_cell_world(layout, cell) for cell in cells]))
+                segment_length = _path_length(segment)
+                if segment_length < min_seg:
+                    continue
+                if layout.min_path_length >= 1.2 and hop == 0 and attempt < 90 and segment_length > 1.5:
+                    continue
+                d_start = segment[1] - segment[0]
+                d_start /= np.linalg.norm(d_start)
+                if prev_dir is None:
+                    if not _rear_clearance_ok(layout, segment[0], d_start):
+                        continue
+                else:
+                    dot = float(np.dot(prev_dir, d_start))
+                    # 防止段间 180° 瞬时折返；前段尽量包含转弯以覆盖进弯/出弯过渡。
+                    if attempt < 150 and dot < -0.25:
+                        continue
+                    if attempt < 80 and dot > 0.92:
+                        continue
+                    if attempt >= 150 and dot < -0.65:
+                        continue
+                candidate = _smooth_path(layout, np.vstack([vertices, segment[1:]]))
+                if not path_is_free(layout, candidate):
+                    continue
+                if attempt < 160 and _max_turn_rad(candidate) > 0.35:
+                    continue
+                vertices.extend(segment[1:])
+                d_end = segment[-1] - segment[-2]
+                prev_dir = d_end / np.linalg.norm(d_end)
+                start = goal
+                break
+            else:
+                break
         else:
-            raise ValueError("无法规划满足长度要求的无碰撞路径")
-    if total_length < layout.min_path_length:
-        raise ValueError("路径段数达到上限，仍无法满足轨迹长度")
-    return np.asarray(world_path, dtype=np.float32)
+            smoothed = _smooth_path(layout, np.asarray(vertices))
+            if _path_length(smoothed) >= layout.min_path_length and path_is_free(layout, smoothed):
+                return smoothed
+    raise ValueError("无法规划满足长度与平滑要求的无碰撞路径")
 
 
 def path_is_free(layout: Layout, path: np.ndarray) -> bool:

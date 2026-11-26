@@ -13,16 +13,7 @@ from rvz.sim.record import generate_episode
 
 
 def test_viz_episode_exports_context_and_reprojection(tmp_path: Path) -> None:
-    cfg = SimConfig(
-        robot_res=48,
-        drone_res=48,
-        steps=1,
-        n_drones=1,
-        warehouse_min_size=12.0,
-        warehouse_max_size=12.0,
-        min_aisles=3,
-        max_aisles=3,
-    )
+    cfg = SimConfig(robot_res=48, drone_res=48, steps=1, n_drones=1)
     episode = generate_episode(9, cfg)
     episode_path = tmp_path / "ep_000009.npz"
     np.savez_compressed(episode_path, **episode)

@@ -17,7 +17,7 @@ LOOKAT_HEIGHT_OFFSET_M = 0.15  # 无人机看向点相对小车中心抬高，�
 
 
 def robot_poses(path: np.ndarray, n_steps: int, dt: float, speed: float) -> np.ndarray:
-    """按路径弧长匀速采样 ``T_W_B`` (T,4,4)，z 向上、yaw 跟随路径切线。"""
+    """按定步弦长沿路径匀速采样 ``T_W_B`` (T,4,4)，z 向上、yaw 跟随平滑切线。"""
     points = np.asarray(path, dtype=np.float64)
     assert points.ndim == 2 and points.shape[1] == 2 and len(points) >= 1
     if n_steps == 1:
@@ -31,14 +31,41 @@ def robot_poses(path: np.ndarray, n_steps: int, dt: float, speed: float) -> np.n
     lengths = np.linalg.norm(segments, axis=1)
     if np.any(lengths <= 1e-10):
         raise ValueError("路径不能含重复相邻点")
-    cumulative = np.concatenate([[0.0], np.cumsum(lengths)])
-    distances = np.arange(n_steps, dtype=np.float64) * speed * dt
-    if distances[-1] > cumulative[-1] + 1e-6:
-        raise ValueError(f"路径总长 {cumulative[-1]:.3f} m 小于轨迹所需 {distances[-1]:.3f} m")
-    indices = np.clip(np.searchsorted(cumulative, distances, side="right") - 1, 0, len(segments) - 1)
-    ratios = (distances - cumulative[indices]) / lengths[indices]
-    positions = points[indices] + segments[indices] * ratios[:, None]
-    tangents = segments[indices]
+    total_length = float(lengths.sum())
+    step_length = speed * dt
+    required_length = (n_steps - 1) * step_length
+    if required_length > total_length + 1e-6:
+        raise ValueError(f"路径总长 {total_length:.3f} m 小于轨迹所需 {required_length:.3f} m")
+
+    positions = np.empty((n_steps, 2), dtype=np.float64)
+    positions[0] = points[0]
+    seg_index = 0
+    for step in range(1, n_steps):
+        prev = positions[step - 1]
+        while seg_index < len(points) - 1 and float(np.linalg.norm(points[seg_index + 1] - prev)) < step_length:
+            seg_index += 1
+        if seg_index >= len(points) - 1:
+            tail = points[-1] - prev
+            tail_norm = float(np.linalg.norm(tail))
+            if tail_norm >= step_length - 1e-5 and tail_norm > 1e-12:
+                positions[step] = prev + tail * (step_length / tail_norm)
+                continue
+            raise ValueError(f"路径长度不足以按步长 {step_length:.4f} m 采样第 {step} 步")
+        a, b = points[seg_index], points[seg_index + 1]
+        direction = b - a
+        offset = a - prev
+        aa = float(np.dot(direction, direction))
+        bb = 2.0 * float(np.dot(offset, direction))
+        cc = float(np.dot(offset, offset)) - step_length * step_length
+        discriminant = max(0.0, bb * bb - 4.0 * aa * cc)
+        t = max(0.0, min(1.0, (-bb + math.sqrt(discriminant)) / (2.0 * aa)))
+        positions[step] = a + t * direction
+
+    tangents = np.empty_like(positions)
+    tangents[0] = positions[1] - positions[0]
+    tangents[-1] = positions[-1] - positions[-2]
+    if n_steps > 2:
+        tangents[1:-1] = positions[2:] - positions[:-2]
     yaws = np.arctan2(tangents[:, 1], tangents[:, 0])
     poses = np.repeat(np.eye(4, dtype=np.float64)[None], n_steps, axis=0)
     poses[:, 0, 0] = np.cos(yaws)

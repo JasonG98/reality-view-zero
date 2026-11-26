@@ -45,8 +45,8 @@ reality-view-zero/
 │       ├── viewer.yaml          # 指向 configs/viewer.yaml 的链接，随包分发
 │       ├── sim/                 # 不得导入 torch
 │       │   ├── __init__.py
-│       │   ├── layout.py        # 布局采样、空闲栅格、A*
-│       │   ├── scene.py         # 程序化 MJCF、仓库资产加载和车体组装
+│       │   ├── layout.py        # 仓库包围盒布局、空闲栅格、平滑 A*
+│       │   ├── scene.py         # 小型仓库资产加载和车体组装
 │       │   ├── assets/          # 离线仓库资产与授权说明
 │       │   ├── rig.py           # 小车相机、无人机自由相机、轨迹
 │       │   └── record.py        # episode 录制与多进程生成 → npz
@@ -271,19 +271,16 @@ def scale_K(K, sx, sy) -> np.ndarray
 ```python
 # layout.py
 @dataclass
-class Layout: ...                                   # 货架/箱子/托盘/墙/灯 + 空闲栅格
-@dataclass(frozen=True)
-class ProceduralColors: ...                         # 墙面、地面和天空的纹理颜色
-def sample_layout(seed: int, cfg: SimConfig) -> tuple[Layout, ProceduralColors]
+class Layout: ...                                   # 仓库包围盒/灯光 + 空闲栅格
+def validate_layout(layout: Layout) -> None         # 几何有效性、空闲栅格一致性与可导航性
 def required_path_length(cfg: SimConfig) -> float   # 走完 steps 步的最短路径长度
-def plan_path(layout: Layout, rng) -> np.ndarray    # 栅格上的 A* 路径，(K,2) 米
+def plan_path(layout: Layout, rng) -> np.ndarray    # 8 邻接 A* + 视线剪枝 + 圆角平滑路径，(K,2) 米
 
 # scene.py
-def layout_to_mjcf(layout: Layout, colors: ProceduralColors, cfg: SimConfig) -> str   # 含 4 个小车固定相机
-def build_scene(seed: int, cfg: SimConfig) -> tuple[Layout, mujoco.MjModel]  # 按 cfg.scene 分派；仓库模型按 cfg 缓存
+def build_scene(seed: int, cfg: SimConfig) -> tuple[Layout, mujoco.MjModel]  # 加载 small_warehouse 并按 cfg 缓存
 
 # rig.py
-def robot_poses(path, n_steps, dt, speed) -> np.ndarray       # (T,4,4) T_W_B，按弧长匀速采样
+def robot_poses(path, n_steps, dt, speed) -> np.ndarray       # (T,4,4) T_W_B，按定步弦长匀速采样与平滑切线朝向
 def drone_trajectories(rng, layout, robot_poses, cfg) -> list[DroneTraj]
 def read_gl_camera(renderer) -> tuple[pos, forward, up]      # 读取单目实际使用的双目平均相机
 
@@ -294,13 +291,13 @@ def generate_many(seeds, cfg, out_dir, workers: int) -> None   # 多进程，逐
 def live_camera_frames(seed: int, cfg: SimConfig, drone_index: int = 0) -> Generator[tuple[np.ndarray, np.ndarray], None, None]
 ```
 要点：
-- `small_warehouse` 从包内归档加载发布方的仓库网格、贴图和物件位置。物件包围盒用于导航栅格、弹簧臂和机位检查，可见性射线只查询显示的网格。导入场景为正后方跟随机位留出规划余量。
-- 两种场景共用带倒角的车壳、轮组、灯标和相机组装。离屏缓冲覆盖实际渲染尺寸，较近的裁剪面保留广角相机下方的地面。
+- 全仓库统一使用 `small_warehouse`：从包内归档加载发布方的仓库网格、贴图和物件位置。物件包围盒用于导航栅格、弹簧臂和机位检查，可见性射线只查询显示的网格，并为正后方跟随机位留出规划余量。
+- 场景组装带倒角的车壳、轮组、灯标和 4 路固定相机。离屏缓冲覆盖实际渲染尺寸，较近的裁剪面保留广角相机下方的地面。
 - 小车每步：设位姿 → `mj_forward` → 渲染 4 路 → 对每台无人机设自由相机 → `update_scene` → 渲染 → 读出 GL 相机位姿 → `gl_cam_to_cv_pose`。
 - 小车前后相机使用 `fovy_deg`；左右相机使用 `robot_side_fovy_deg=120`、`robot_side_down_deg=15`，MJCF 中直接设置相机 XY 轴实现无滚转下倾，4 路内参分别写入 `K_robot`。
 - `rig` 生成严格正后方的近低机位轨迹。`record` 先用射线计算机位前方的安全距离，通过双向限幅平滑缩短弹簧臂，再从单目实际使用的双目平均 GL 相机读取位姿。遮挡物通过 `mj_ray` 找出，仅在当前无人机画面用 geom group 隐藏，随后立即恢复模型分组。录制与预览逐帧校验几何、灯标质心和重投影误差有限性，任一步失败时整段重采样。
 - 无人机相机位置检查（不在几何体内、小车在视野内）使用 `Layout` 里的几何体 AABB，不依赖物理引擎碰撞。
-- 重采样有最大次数，超出抛异常；实际次数与发光标记重投影误差记录在 `meta` 中。
+- 重采样有最大次数，超出抛异常；实际次数、发光标记重投影误差以及轻量诊断统计 `diagnostics`（`max_step_yaw_deg`、`total_yaw_change_deg`、弹簧臂缩短步数与最小跟随距离、遮挡物隐藏步数与总隐藏几何体数）记录在 `meta_json` 中，不改 npz 数组字段，不升 `SCHEMA_VERSION`。`plan_path` 在起点段同时检查正后方间隙，避免低机位跟拍首步贴墙出视野。
 - `viewer.py` 从 `live_camera_frames` 逐步读取同一时刻的小车 RGB `(4,H,W,3)` 和无人机 RGB `(Hd,Wd,3)`。预览沿用录制的候选批次与重采样顺序，依次预检到指定机位。`viewer` 默认加载 `configs/viewer.yaml`。窗口按屏幕尺寸布局并缩放画面，按 `sim.dt` 请求下一组，退出时关闭生成器和离屏渲染器。
 
 ### 5.3 `data`
@@ -387,7 +384,7 @@ def run(cfg: Config, stage: str, run_dir: Path, resume: bool, overfit_seed: int 
 # metrics.py
 def lpips_score(a, b) -> Tensor;  def psnr(a, b) -> Tensor;  def ssim(a, b) -> Tensor
 def baseline_copy_nearest_cam(sample) -> Tensor
-def bucketize(meta, T_tgt) -> dict[str, str]        # 距离/高度/方位象限
+def bucketize(meta, T_tgt) -> dict[str, str]        # 距离/高度/转弯角速度/弹簧臂与遮挡状态
 def measure_latency(gen, cond, steps, device, warmup=10, iters=50) -> dict
 # report.py
 def build_report(results, out_dir) -> None           # report.json + 对比图
@@ -466,6 +463,6 @@ def build_report(results, out_dir) -> None           # report.json + 对比图
 ## 11. 已知限制
 
 - 无人机能看到小车相机看不到的区域（被货架遮挡），这部分只能靠猜；通过限制无人机距离/朝向、时间上下文缓解，通过分桶评估暴露。
-- 程序化仓库由基本体拼成，画面朴素、几何规整，可能引入"捷径"；靠随机化与未见布局验证缓解。
+- 主线统一使用单布局小型仓库 `small_warehouse`，`train/val/test` 划分检验的是未见轨迹与未见机位的新视角泛化，不覆盖跨仓库布局泛化（跨场景/多布局扩展留待 M8）。
 - 自由相机无滚转；本任务不需要。
 - Mac 上 bf16、JVP、部分算子可能不可用（见 SPEC §8、§12.2），Mac 只承担调试角色。

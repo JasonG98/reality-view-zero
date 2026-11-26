@@ -11,7 +11,7 @@ import yaml
 # YAML 解析结果的递归类型，避免 Any。
 YamlValue = None | bool | int | float | str | list["YamlValue"] | dict[str, "YamlValue"]
 SCHEMA_VERSION = 2
-SceneName = Literal["procedural", "small_warehouse"]
+SceneName = Literal["small_warehouse"]
 
 
 @dataclass(frozen=True)
@@ -26,10 +26,6 @@ class SimConfig:
     dt: float = 0.1  # 步长，秒（初值）
     steps: int = 40  # 每 episode 步数（初值，D1）
     n_drones: int = 3  # 每步无人机相机数 M（FR-SIM-6）
-    warehouse_min_size: float = 12.0
-    warehouse_max_size: float = 20.0
-    min_aisles: int = 3
-    max_aisles: int = 6
     grid_resolution: float = 0.25
     robot_radius: float = 0.35
     robot_speed: float = 0.5  # 米/秒；路径按弧长匀速采样
@@ -40,7 +36,7 @@ class SimConfig:
     drone_elevation_min_deg: float = -30.0
     drone_elevation_max_deg: float = -15.0
     max_resamples: int = 100
-    scene: SceneName = "procedural"
+    scene: SceneName = "small_warehouse"
 
     def __post_init__(self) -> None:
         if self.robot_res <= 0 or self.drone_res <= 0 or self.steps <= 0 or self.n_drones <= 0:
@@ -51,10 +47,6 @@ class SimConfig:
             raise ValueError("robot_side_fovy_deg 必须在 (0, 180) 内")
         if not 0.0 <= self.robot_side_down_deg < 90.0:
             raise ValueError("robot_side_down_deg 必须在 [0, 90) 内")
-        if not 0.0 < self.warehouse_min_size <= self.warehouse_max_size:
-            raise ValueError("仓库尺寸范围无效")
-        if not 3 <= self.min_aisles <= self.max_aisles <= 6:
-            raise ValueError("通道数范围必须满足 3 <= min_aisles <= max_aisles <= 6")
         if self.grid_resolution <= 0.0 or self.robot_radius <= 0.0 or self.robot_speed <= 0.0:
             raise ValueError("栅格分辨率、机器人半径和速度必须为正")
         if not 0.0 < self.drone_distance_min <= self.drone_distance_max:
