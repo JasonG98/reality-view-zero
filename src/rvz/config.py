@@ -157,6 +157,14 @@ def _build(cls: type[T], raw: Mapping[str, YamlValue]) -> T:
             if not isinstance(value, Mapping):
                 raise ValueError(f"配置段 {cls.__name__}.{name} 应为映射，实际为 {type(value).__name__}")
             kwargs[name] = _build(target, value)
+        elif target is float:
+            # PyYAML 按 YAML 1.1 解析，会把无小数点的科学计数法（如 3e-4）读成字符串。
+            if isinstance(value, bool) or not isinstance(value, int | float | str):
+                raise ValueError(f"配置项 {cls.__name__}.{name} 应为浮点数，实际为 {value!r}")
+            try:
+                kwargs[name] = float(value)
+            except ValueError as exc:
+                raise ValueError(f"配置项 {cls.__name__}.{name} 应为浮点数，实际为 {value!r}") from exc
         else:
             kwargs[name] = value
     return cls(**kwargs)  # type: ignore[arg-type]  # kwargs 已由字段名与 hints 过滤

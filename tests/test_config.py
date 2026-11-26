@@ -88,3 +88,19 @@ def test_dump_config_roundtrip_and_new_validations(tmp_path: Path) -> None:
         ModelConfig(dim=10, heads=3)
     with pytest.raises(ValueError, match=r"train\.ema"):
         TrainConfig(ema=1.0)
+
+
+def test_scientific_notation_float_in_override_and_yaml(tmp_path: Path) -> None:
+    """回归：YAML 1.1 会把无小数点的科学计数法（如 3e-4）解析为字符串，配置加载必须转为 float。"""
+    yaml_path = tmp_path / "sci.yaml"
+    yaml_path.write_text("train:\n  lr: 1e-4\n", encoding="utf-8")
+    cfg = load_config(yaml_path)
+    assert isinstance(cfg.train.lr, float) and cfg.train.lr == pytest.approx(1e-4)
+
+    overridden = load_config(None, ["train.lr=3e-4"])
+    assert isinstance(overridden.train.lr, float) and overridden.train.lr == pytest.approx(3e-4)
+
+    with pytest.raises(ValueError, match="浮点数"):
+        load_config(None, ["train.lr=not_a_float"])
+    with pytest.raises(ValueError, match="浮点数"):
+        load_config(None, ["train.lr=true"])
