@@ -19,12 +19,14 @@ from torch.utils.data import DataLoader
 from rvz.config import Config, dump_config
 from rvz.data.dataset import SampleBatch, collate_samples, make_dataset
 from rvz.device import autocast_ctx, get_device, seed_everything
+from rvz.models.generator import Generator, build_condition
 from rvz.models.regress import RegressBaseline
-from rvz.train.losses import LpipsFn, LpipsLoss, regress_loss_breakdown
+from rvz.train.losses import LpipsFn, LpipsLoss, sample_fm_inputs, x_prediction_loss_breakdown
 
 logger = logging.getLogger(__name__)
 
-StageName = Literal["regress"]
+StageName = Literal["regress", "fm"]
+TrainModel = RegressBaseline | Generator
 CheckpointValue = (
     None | bool | int | float | str | torch.Tensor | list["CheckpointValue"] | dict[str, "CheckpointValue"]
 )
@@ -85,6 +87,30 @@ def _infinite_batches(loader: DataLoader[SampleBatch]) -> Iterator[SampleBatch]:
         yield from loader
 
 
+def _build_stage_model(stage: StageName, cfg: Config, *, feat_dim: int, num_patches: int) -> TrainModel:
+    if stage == "regress":
+        return RegressBaseline(
+            feat_dim=feat_dim,
+            num_patches=num_patches,
+            drone_res=cfg.sim.drone_res,
+            dim=cfg.model.dim,
+            heads=cfg.model.heads,
+        )
+    if stage == "fm":
+        return Generator(
+            feat_dim=feat_dim,
+            num_ctx_patches=num_patches,
+            encoder_res=cfg.encoder.res,
+            drone_res=cfg.sim.drone_res,
+            patch=cfg.model.patch,
+            dim=cfg.model.dim,
+            depth=cfg.model.depth,
+            heads=cfg.model.heads,
+            p_drop=cfg.model.p_drop,
+        )
+    raise ValueError(f"当前里程碑仅支持 stage='regress' 或 'fm'，收到：{stage!r}")
+
+
 def run(
     cfg: Config,
     stage: StageName,
@@ -96,8 +122,8 @@ def run(
     device: torch.device | None = None,
 ) -> Path:
     """运行指定阶段训练，写入 config.yaml、log.jsonl 与 ckpt/latest.pt。"""
-    if stage != "regress":
-        raise ValueError(f"当前里程碑仅支持 stage='regress'，收到：{stage!r}")
+    if stage not in ("regress", "fm"):
+        raise ValueError(f"当前里程碑仅支持 stage='regress' 或 'fm'，收到：{stage!r}")
 
     run_path = Path(run_dir)
     ckpt_dir = run_path / "ckpt"
@@ -112,12 +138,11 @@ def run(
     dataset = make_dataset(cfg, split="train", use_cache=True, seeds=seeds)
     assert dataset.manifest is not None
 
-    model = RegressBaseline(
+    model = _build_stage_model(
+        stage,
+        cfg,
         feat_dim=dataset.manifest.embed_dim,
         num_patches=dataset.manifest.num_patches,
-        drone_res=cfg.sim.drone_res,
-        dim=cfg.model.dim,
-        heads=cfg.model.heads,
     ).to(target_device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr)
     ema = ExponentialMovingAverage(model, cfg.train.ema) if cfg.train.ema > 0.0 else None
@@ -141,7 +166,8 @@ def run(
         start_step = int(checkpoint["step"])
         logger.info("从 %s 恢复训练，起始步 %d", latest_path, start_step)
 
-    generator = torch.Generator().manual_seed(cfg.train.seed + start_step)
+    loader_gen = torch.Generator().manual_seed(cfg.train.seed + start_step)
+    noise_gen = torch.Generator().manual_seed(cfg.train.seed + 100003 + start_step)
     batch_size = min(cfg.train.batch, len(dataset))
     loader: DataLoader[SampleBatch] = DataLoader(
         dataset,  # type: ignore[arg-type]  # collate_samples 将 Sample 聚合为 SampleBatch
@@ -149,8 +175,9 @@ def run(
         shuffle=True,
         drop_last=False,
         num_workers=cfg.train.num_workers,
+        persistent_workers=cfg.train.num_workers > 0,
         collate_fn=collate_samples,
-        generator=generator,
+        generator=loader_gen,
     )
     batches = _infinite_batches(loader)
     log_path = run_path / "log.jsonl"
@@ -164,14 +191,33 @@ def run(
         assert batch.ctx_feats is not None
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast_ctx(target_device):
-            pred = model(batch.ctx_feats, batch.ctx_T_tgt, batch.tgt_T, batch.K_tgt)
-            loss, mse_val, lpips_val = regress_loss_breakdown(
-                pred,
-                batch.tgt_rgb,
-                lpips_fn=active_lpips,
-                lpips_weight=cfg.train.lpips_weight,
+        if stage == "regress":
+            assert isinstance(model, RegressBaseline)
+            with autocast_ctx(target_device):
+                pred = model(batch.ctx_feats, batch.ctx_T_tgt, batch.tgt_T, batch.K_tgt)
+        else:
+            assert isinstance(model, Generator)
+            cond = build_condition(
+                batch.ctx_feats,
+                batch.ctx_T_tgt,
+                batch.K_ctx,
+                batch.tgt_T,
+                batch.K_tgt,
+                encoder_res=cfg.encoder.res,
+                drone_res=cfg.sim.drone_res,
+                tgt_patch=cfg.model.patch,
             )
+            x_t, t = sample_fm_inputs(batch.tgt_rgb, generator=noise_gen)
+            with autocast_ctx(target_device):
+                pred = model(x_t, t, cond.ctx_feats, cond.rays_ctx, cond.rays_tgt)
+
+        # 损失在 autocast_ctx 外部按 fp32 计算，确保 MSE 与 VGG LPIPS 不被降回 bf16。
+        loss, mse_val, lpips_val = x_prediction_loss_breakdown(
+            pred,
+            batch.tgt_rgb,
+            lpips_fn=active_lpips,
+            lpips_weight=cfg.train.lpips_weight,
+        )
         assert torch.isfinite(loss), f"step {step} 出现非有限损失：{loss.item()}"
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -203,7 +249,7 @@ def run(
             )
 
         if step % cfg.train.save_every == 0 or step == cfg.train.steps:
-            payload = {
+            payload: dict[str, CheckpointValue] = {
                 "stage": stage,
                 "step": step,
                 "model": {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()},

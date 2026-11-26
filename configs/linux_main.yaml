@@ -3,9 +3,12 @@ sim:
   robot_res: 128
   drone_res: 128
   steps: 40
+data:
+  max_cached_episodes: 512
 model:
   dim: 512
   depth: 12
   heads: 8
 train:
   batch: 32
+  num_workers: 4

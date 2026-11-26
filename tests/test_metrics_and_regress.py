@@ -20,9 +20,11 @@ from rvz.evaluate.metrics import (
     psnr,
     ssim,
 )
+from rvz.evaluate.report import sample_checkpoint
 from rvz.models.regress import RegressBaseline
 from rvz.train.loop import ExponentialMovingAverage
 from rvz.train.loop import run as run_train
+from rvz.train.losses import LpipsLoss
 
 
 def _mock_lpips(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -251,3 +253,111 @@ def test_arch_dependency_boundaries() -> None:
             for mod in imports:
                 for bad in forbidden:
                     assert mod != bad and not mod.startswith(f"{bad}."), f"{py_file.name} 违规导入 {mod}"
+
+
+def test_lpips_loss_runs_in_fp32_even_inside_outer_bf16_autocast() -> None:
+    """回归：外层开启 bf16 autocast 时，LpipsLoss 内部仍须显式关闭 autocast 保持 fp32 卷积。"""
+    observed: dict[str, object] = {}
+
+    class _ProbeConvNet(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = torch.nn.Conv2d(3, 3, kernel_size=1)
+
+        def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            out = self.conv(pred - target)
+            observed["autocast_enabled"] = torch.is_autocast_enabled("cpu")
+            observed["out_dtype"] = out.dtype
+            return out.square().mean(dim=(1, 2, 3))
+
+    loss_mod = LpipsLoss.__new__(LpipsLoss)
+    torch.nn.Module.__init__(loss_mod)
+    loss_mod.net = _ProbeConvNet()  # type: ignore[assignment]
+
+    pred = torch.randn(2, 3, 16, 16, dtype=torch.bfloat16)
+    target = torch.randn(2, 3, 16, 16, dtype=torch.bfloat16)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        val = loss_mod(pred, target)
+    assert observed["autocast_enabled"] is False
+    assert observed["out_dtype"] == torch.float32
+    assert val.dtype == torch.float32
+
+
+def test_fm_train_resume_eval_and_sample_end_to_end(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw"
+    write_synthetic_episode(raw_dir, seed=0, num_steps=4, num_drones=2, robot_res=32, drone_res=16)
+    write_synthetic_episode(raw_dir, seed=10000, num_steps=3, num_drones=2, robot_res=32, drone_res=16)
+
+    enc_cfg = EncoderConfig(id="fake/dinov3-tiny", res=32)
+    cfg = Config(
+        sim=SimConfig(robot_res=32, drone_res=16, steps=4, n_drones=2),
+        data=DataConfig(raw_dir=str(raw_dir), feats_dir=str(tmp_path / "feats")),
+        encoder=enc_cfg,
+        model=ModelConfig(dim=16, depth=1, heads=4, patch=8, p_drop=0.15),
+        train=TrainConfig(batch=4, lr=1e-2, ema=0.9, seed=0, steps=2, log_every=1, save_every=2, lpips_weight=0.1),
+    )
+    cache_dir = feature_cache_dir(cfg.data.feats_dir, enc_cfg)
+    encoder = DeterministicFakeEncoder(encoder_id=enc_cfg.id, input_res=enc_cfg.res)
+    cache_features(raw_dir, cache_dir, encoder, enc_cfg, device=torch.device("cpu"))
+
+    run_dir = tmp_path / "runs" / "fm_tiny"
+    ckpt_path = run_train(
+        cfg,
+        "fm",
+        run_dir,
+        overfit_seed=0,
+        lpips_fn=_mock_lpips,
+        device=torch.device("cpu"),
+    )
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    assert ckpt["stage"] == "fm" and ckpt["step"] == 2
+
+    cfg_resume = Config(
+        sim=cfg.sim,
+        data=cfg.data,
+        encoder=cfg.encoder,
+        model=cfg.model,
+        train=TrainConfig(batch=4, lr=1e-2, ema=0.9, seed=0, steps=4, log_every=2, save_every=2, lpips_weight=0.1),
+    )
+    resumed = run_train(
+        cfg_resume,
+        "fm",
+        run_dir,
+        resume=True,
+        overfit_seed=0,
+        lpips_fn=_mock_lpips,
+        device=torch.device("cpu"),
+    )
+    assert torch.load(resumed, map_location="cpu", weights_only=True)["step"] == 4
+
+    eval_dir = tmp_path / "eval_fm"
+    report = evaluate_checkpoint(
+        resumed,
+        cfg,
+        split="val",
+        out_dir=eval_dir,
+        use_ema=True,
+        steps=2,
+        lpips_metric=_mock_lpips,
+        device=torch.device("cpu"),
+    )
+    assert report.name == "fm" and report.sample_steps == 2 and report.num_samples == 4
+    assert (eval_dir / "report.json").exists()
+    assert all(math.isfinite(v) for v in (report.lpips.mean, report.psnr.mean, report.ssim.mean))
+
+    sample_dir = tmp_path / "sample_fm"
+    outputs = sample_checkpoint(
+        resumed,
+        cfg,
+        seed=10000,
+        step=2,
+        drone_index=1,
+        steps=2,
+        out_dir=sample_dir,
+        lpips_metric=_mock_lpips,
+        device=torch.device("cpu"),
+    )
+    for key in ("pred", "gt", "diff", "comparison", "metrics"):
+        assert outputs[key].exists()
+    metrics_json = json.loads(outputs["metrics"].read_text(encoding="utf-8"))
+    assert metrics_json["stage"] == "fm" and metrics_json["sample_steps"] == 2

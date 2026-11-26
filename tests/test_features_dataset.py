@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from fakes import DeterministicFakeEncoder, write_synthetic_episode
 from rvz.config import Config, DataConfig, EncoderConfig
@@ -154,3 +155,52 @@ def test_cache_features_moves_module_encoder_to_target_device(tmp_path: Path) ->
     target = torch.device("cpu")
     cache_features(raw_dir, tmp_path / "feats", encoder, enc_cfg, device=target)
     tracked_to.assert_called_once_with(target)
+
+
+def test_dataset_caches_feat_mmaps_and_supports_multiprocess_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回归：重复读取同一 episode 应复用 .npy mmap 句柄，且 num_workers>0 下 DataLoader 安全。"""
+    raw_dir = tmp_path / "raw"
+    write_synthetic_episode(raw_dir, seed=0, num_steps=4, num_drones=2, robot_res=32, drone_res=32)
+    write_synthetic_episode(raw_dir, seed=1, num_steps=4, num_drones=2, robot_res=32, drone_res=32)
+
+    enc_cfg = EncoderConfig(id="fake/dinov3-tiny", res=32)
+    cfg = Config(
+        data=DataConfig(raw_dir=str(raw_dir), feats_dir=str(tmp_path / "feats"), max_cached_episodes=8),
+        encoder=enc_cfg,
+    )
+    cache_dir = feature_cache_dir(cfg.data.feats_dir, enc_cfg)
+    encoder = DeterministicFakeEncoder(encoder_id=enc_cfg.id, input_res=enc_cfg.res)
+    cache_features(raw_dir, cache_dir, encoder, enc_cfg, device=torch.device("cpu"))
+
+    dataset = make_dataset(cfg, split="train", use_cache=True)
+    assert len(dataset._feat_cache) == 0
+
+    real_load = np.load
+    feat_loads = 0
+
+    def _counting_load(file: Path | str, *args: object, **kwargs: object) -> object:
+        nonlocal feat_loads
+        if str(file).endswith(".npy"):
+            feat_loads += 1
+        return real_load(file, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("rvz.data.dataset.np.load", _counting_load)
+    _ = dataset[0]
+    _ = dataset[1]
+    _ = dataset[2]
+    assert feat_loads == 1
+
+    # 多 worker DataLoader 应正常加载全部样本。
+    monkeypatch.undo()
+    fresh_ds = make_dataset(cfg, split="train", use_cache=True)
+    loader = DataLoader(
+        fresh_ds,  # type: ignore[arg-type]
+        batch_size=4,
+        shuffle=False,
+        num_workers=2,
+        collate_fn=collate_samples,
+    )
+    total = sum(batch.tgt_rgb.shape[0] for batch in loader)
+    assert total == len(fresh_ds)

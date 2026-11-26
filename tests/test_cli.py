@@ -196,7 +196,12 @@ def test_eval_arguments_and_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cli.main(["eval", "--baseline", "copy_nearest_cam", "--out", "runs/out_n"]) == 0
     eval_nearest.assert_called_once_with(config, split="val", seeds=None, out_dir=Path("runs/out_n"), max_samples=None)
 
-    assert cli.main(["eval", "--checkpoint", "runs/r/ckpt/latest.pt", "--no-use-ema", "--max-samples", "10"]) == 0
+    assert (
+        cli.main(
+            ["eval", "--checkpoint", "runs/r/ckpt/latest.pt", "--no-use-ema", "--steps", "4", "--max-samples", "10"]
+        )
+        == 0
+    )
     eval_ckpt.assert_called_once_with(
         "runs/r/ckpt/latest.pt",
         config,
@@ -204,8 +209,50 @@ def test_eval_arguments_and_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
         seeds=None,
         out_dir=Path("runs/eval_latest"),
         use_ema=False,
+        steps=4,
         max_samples=10,
     )
 
     with pytest.raises(ValueError, match=r"只能指定"):
         cli.main(["eval"])
+
+
+def test_sample_arguments_and_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = Config()
+    monkeypatch.setattr(cli, "load_config", Mock(return_value=config))
+    sample_mock = Mock(return_value={"comparison": Path("runs/samples/out/comparison.png")})
+    monkeypatch.setattr(cli, "sample_checkpoint", sample_mock)
+
+    exit_code = cli.main(
+        [
+            "sample",
+            "--checkpoint",
+            "runs/fm/ckpt/latest.pt",
+            "--seed",
+            "10000",
+            "--step",
+            "12",
+            "--drone-index",
+            "1",
+            "--steps",
+            "50",
+            "--out",
+            "runs/samples/out",
+            "--no-use-ema",
+            "--sample-seed",
+            "7",
+        ]
+    )
+
+    assert exit_code == 0
+    sample_mock.assert_called_once_with(
+        "runs/fm/ckpt/latest.pt",
+        config,
+        seed=10000,
+        step=12,
+        drone_index=1,
+        steps=50,
+        out_dir="runs/samples/out",
+        use_ema=False,
+        sample_seed=7,
+    )

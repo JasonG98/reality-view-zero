@@ -1,4 +1,4 @@
-"""评估指标（LPIPS/PSNR/SSIM）与 M2 基线（copy_nearest_cam / regress）评估（SPEC §7.1–7.2、ARCH §5.6）。"""
+"""评估指标（LPIPS/PSNR/SSIM）与 M2/M3 基线及 checkpoint 评估（SPEC §7.1–7.2、ARCH §5.6）。"""
 
 import importlib.metadata
 import json
@@ -21,7 +21,9 @@ from torch.utils.data import DataLoader
 from rvz.config import Config
 from rvz.data.dataset import Sample, SampleBatch, SplitName, collate_samples, make_dataset
 from rvz.device import autocast_ctx, get_device
+from rvz.models.generator import Generator, build_condition
 from rvz.models.regress import RegressBaseline
+from rvz.models.sampler import sample as sample_generator
 
 SSIM_WINDOW_SIZE = 11
 SSIM_SIGMA = 1.5
@@ -29,6 +31,8 @@ SSIM_C1 = 0.01**2
 SSIM_C2 = 0.03**2
 PSNR_MSE_FLOOR = 1e-10
 _UNIT_RANGE_TOL = 1e-3
+
+EvalModel = RegressBaseline | Generator
 
 
 class LpipsEvaluator(Protocol):
@@ -56,6 +60,7 @@ class EvalReport:
     timestamp: str
     checkpoint: str | None = None
     use_ema: bool | None = None
+    sample_steps: int | None = None
     rvz_version: str = ""
 
 
@@ -127,7 +132,7 @@ def lpips_score(a: torch.Tensor, b: torch.Tensor, *, metric: LpipsEvaluator | No
     """在 `[0, 1]` 范围计算逐样本 VGG LPIPS，形状 `(B,)`。"""
     x, y = _prepare_unit_pair(a, b)
     evaluator = metric if metric is not None else make_lpips_metric(x.device)
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast(device_type=x.device.type, enabled=False):
         raw = evaluator(x * 2.0 - 1.0, y * 2.0 - 1.0)
     return raw.reshape(x.shape[0]).float()
 
@@ -145,6 +150,71 @@ def baseline_copy_nearest_cam(sample: Sample) -> torch.Tensor:
     if selected.shape[-2:] != target_hw:
         selected = F.interpolate(selected, size=target_hw, mode="bilinear", align_corners=False)
     return selected.squeeze(0).mul(2.0).sub(1.0).clamp(-1.0, 1.0)
+
+
+def load_checkpoint_model(
+    checkpoint_path: str | Path,
+    *,
+    use_ema: bool = True,
+    device: torch.device | None = None,
+) -> tuple[str, EvalModel, bool]:
+    """加载 regress 或 fm checkpoint（优先使用 EMA 权重）并置为 eval 模式。"""
+    ckpt_file = Path(checkpoint_path)
+    checkpoint = torch.load(ckpt_file, map_location="cpu", weights_only=True)
+    stage = str(checkpoint["stage"])
+    target_device = device if device is not None else get_device()
+    model_meta = checkpoint["model_meta"]
+
+    model: EvalModel
+    if stage == "regress":
+        model = RegressBaseline(**model_meta).to(target_device)
+    elif stage == "fm":
+        model = Generator(**model_meta).to(target_device)
+    else:
+        raise ValueError(f"当前仅支持评估 regress 或 fm checkpoint，收到 stage={stage!r}")
+
+    ema_state = checkpoint["ema"]
+    using_ema = bool(use_ema and ema_state is not None)
+    weights = ema_state if using_ema else checkpoint["model"]
+    model.load_state_dict(weights)
+    model.eval()
+    return stage, model, using_ema
+
+
+def predict_batch(
+    stage: str,
+    model: EvalModel,
+    batch: SampleBatch,
+    *,
+    steps: int = 50,
+    limit: int | None = None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """对一个 SampleBatch 执行模型前向或 Flow Matching 采样，返回 `[-1, 1]` 预测 `(B, 3, Hd, Wd)`。"""
+    assert batch.ctx_feats is not None
+    n = batch.tgt_rgb.shape[0] if limit is None else min(batch.tgt_rgb.shape[0], limit)
+    ctx_feats = batch.ctx_feats[:n]
+    ctx_T_tgt = batch.ctx_T_tgt[:n]
+    K_ctx = batch.K_ctx[:n]
+    tgt_T = batch.tgt_T[:n]
+    K_tgt = batch.K_tgt[:n]
+
+    if stage == "regress":
+        assert isinstance(model, RegressBaseline)
+        with autocast_ctx(ctx_feats.device):
+            return model(ctx_feats, ctx_T_tgt, tgt_T, K_tgt)
+    assert stage == "fm" and isinstance(model, Generator)
+    cond = build_condition(
+        ctx_feats,
+        ctx_T_tgt,
+        K_ctx,
+        tgt_T,
+        K_tgt,
+        encoder_res=model.encoder_res,
+        drone_res=model.drone_res,
+        tgt_patch=model.patch,
+    )
+    return sample_generator(model, cond, steps=steps, kind="fm", generator=generator)
 
 
 def _git_hash() -> str | None:
@@ -230,25 +300,15 @@ def evaluate_checkpoint(
     seeds: Sequence[int] | None = None,
     out_dir: str | Path | None = None,
     use_ema: bool = True,
+    steps: int = 50,
+    sample_seed: int = 0,
     max_samples: int | None = None,
     lpips_metric: LpipsEvaluator | None = None,
     device: torch.device | None = None,
 ) -> EvalReport:
-    """加载 checkpoint（默认用 EMA 权重）并在指定划分上计算 LPIPS/PSNR/SSIM。"""
-    ckpt_file = Path(checkpoint_path)
-    checkpoint = torch.load(ckpt_file, map_location="cpu", weights_only=True)
-    stage = str(checkpoint["stage"])
-    if stage != "regress":
-        raise ValueError(f"当前仅支持评估 regress checkpoint，收到 stage={stage!r}")
-
+    """加载 regress/fm checkpoint（默认用 EMA 权重）并在指定划分上计算 LPIPS/PSNR/SSIM。"""
     target_device = device if device is not None else get_device()
-    model_meta = checkpoint["model_meta"]
-    model = RegressBaseline(**model_meta).to(target_device)
-    ema_state = checkpoint["ema"]
-    using_ema = bool(use_ema and ema_state is not None)
-    weights = ema_state if using_ema else checkpoint["model"]
-    model.load_state_dict(weights)
-    model.eval()
+    stage, model, using_ema = load_checkpoint_model(checkpoint_path, use_ema=use_ema, device=target_device)
 
     dataset = make_dataset(cfg, split=split, use_cache=True, seeds=seeds)
     metric = lpips_metric if lpips_metric is not None else make_lpips_metric(target_device)
@@ -260,6 +320,7 @@ def evaluate_checkpoint(
         num_workers=cfg.train.num_workers,
         collate_fn=collate_samples,
     )
+    sample_gen = torch.Generator().manual_seed(sample_seed)
 
     lpips_vals: list[float] = []
     psnr_vals: list[float] = []
@@ -271,14 +332,7 @@ def evaluate_checkpoint(
                 break
             remaining = total - seen
             batch = batch.to(target_device)
-            assert batch.ctx_feats is not None
-            with autocast_ctx(target_device):
-                pred = model(
-                    batch.ctx_feats[:remaining],
-                    batch.ctx_T_tgt[:remaining],
-                    batch.tgt_T[:remaining],
-                    batch.K_tgt[:remaining],
-                )
+            pred = predict_batch(stage, model, batch, steps=steps, limit=remaining, generator=sample_gen)
             pred_unit = to_unit_range(pred)
             tgt_unit = to_unit_range(batch.tgt_rgb[:remaining])
             lpips_vals.extend(lpips_score(pred_unit, tgt_unit, metric=metric).cpu().tolist())
@@ -296,8 +350,9 @@ def evaluate_checkpoint(
         platform=f"{sys.platform}-{platform.machine()}",
         git_hash=_git_hash(),
         timestamp=datetime.now(UTC).isoformat(),
-        checkpoint=str(ckpt_file),
+        checkpoint=str(Path(checkpoint_path)),
         use_ema=using_ema,
+        sample_steps=steps if stage == "fm" else None,
         rvz_version=importlib.metadata.version("reality-view-zero"),
     )
     _write_report(report, out_dir)

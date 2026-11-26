@@ -65,6 +65,11 @@ class SimConfig:
 class DataConfig:
     raw_dir: str = "data/raw"
     feats_dir: str = "data/feats"
+    max_cached_episodes: int = 512
+
+    def __post_init__(self) -> None:
+        if self.max_cached_episodes <= 0:
+            raise ValueError("data.max_cached_episodes 必须为正整数")
 
 
 @dataclass(frozen=True)

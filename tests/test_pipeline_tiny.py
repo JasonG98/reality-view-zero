@@ -9,6 +9,7 @@ from fakes import DeterministicFakeEncoder
 from rvz.config import Config, DataConfig, EncoderConfig, ModelConfig, SimConfig, TrainConfig
 from rvz.data.features import cache_features, feature_cache_dir
 from rvz.evaluate.metrics import evaluate_checkpoint, evaluate_copy_nearest_cam
+from rvz.evaluate.report import sample_checkpoint
 from rvz.sim.record import generate_many
 from rvz.train.loop import run as run_train
 
@@ -73,3 +74,37 @@ def test_pipeline_tiny_sim_cache_regress_eval(tmp_path: Path) -> None:
     assert reg.num_samples == (sim_cfg.steps - 1) * sim_cfg.n_drones
     assert (regress_dir / "report.json").exists()
     assert all(math.isfinite(v) for v in (reg.lpips.mean, reg.psnr.mean, reg.ssim.mean))
+
+    # 5. 跑 2 步 fm 训练 → 采样对比图 → 在 val 上 2 步采样评估。
+    fm_run_dir = tmp_path / "runs" / "fm_tiny"
+    fm_ckpt = run_train(cfg, "fm", fm_run_dir, lpips_fn=_mock_lpips, device=torch.device("cpu"))
+    assert fm_ckpt.exists()
+
+    fm_sample_dir = tmp_path / "runs" / "sample_fm"
+    sample_outputs = sample_checkpoint(
+        fm_ckpt,
+        cfg,
+        seed=10000,
+        step=1,
+        drone_index=0,
+        steps=2,
+        out_dir=fm_sample_dir,
+        lpips_metric=_mock_lpips,
+        device=torch.device("cpu"),
+    )
+    assert sample_outputs["comparison"].exists()
+
+    fm_eval_dir = tmp_path / "runs" / "eval_fm"
+    fm_report = evaluate_checkpoint(
+        fm_ckpt,
+        cfg,
+        split="val",
+        out_dir=fm_eval_dir,
+        use_ema=True,
+        steps=2,
+        lpips_metric=_mock_lpips,
+        device=torch.device("cpu"),
+    )
+    assert fm_report.name == "fm" and fm_report.sample_steps == 2
+    assert fm_report.num_samples == (sim_cfg.steps - 1) * sim_cfg.n_drones
+    assert all(math.isfinite(v) for v in (fm_report.lpips.mean, fm_report.psnr.mean, fm_report.ssim.mean))

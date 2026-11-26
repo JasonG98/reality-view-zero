@@ -336,10 +336,11 @@ class Sample:
 @dataclass(frozen=True)
 class SampleBatch: ...            # 批维度堆叠容器，含 .to(device) 与形状校验
 def collate_samples(samples) -> SampleBatch
-class EpisodeDataset(torch.utils.data.Dataset): ...
+class EpisodeDataset(torch.utils.data.Dataset):
+    def find_index(self, seed: int, step: int, drone_index: int) -> int
 def make_dataset(cfg, split="train", use_cache: bool = True, ...) -> EpisodeDataset
 ```
-- 位姿换算全部在 `dataset.py` 里用 `geometry` 完成，**模型侧只拿到"已在目标 Base 系下"的变换**。`K_ctx` 在加载时通过 `geometry.scale_K` 缩放到 `encoder.res` 像素坐标系，与特征网格一致。
+- 位姿换算全部在 `dataset.py` 里用 `geometry` 完成，**模型侧只拿到"已在目标 Base 系下"的变换**。`K_ctx` 在加载时通过 `geometry.scale_K` 缩放到 `encoder.res` 像素坐标系，与特征网格一致。`EpisodeDataset` 按 `DataConfig.max_cached_episodes`（默认 512）延迟缓存 RGB 与 `.npy` mmap 句柄，保证多 worker DataLoader 安全与高吞吐。
 
 ### 5.4 `models`
 
@@ -355,43 +356,51 @@ class FrozenEncoder(nn.Module):
 class RegressBaseline(nn.Module):
     def forward(self, ctx_feats, ctx_T_tgt, tgt_T, K_tgt) -> Tensor   # (B,3,Hd,Wd) [-1,1]
 # rays.py（M3）
-def plucker_rays(K, T_B_C, h, w, patch) -> Tensor  # (N_patch, 6)，patch 中心像素
+def plucker_rays_numpy(K, T_B_C, h, w, patch) -> np.ndarray           # (..., N_patch, 6) 纯 numpy 参考
+def plucker_rays(K, T_B_C, h, w, patch) -> Tensor                     # (..., N_patch, 6)，patch 中心像素
 # generator.py（M3）
+@dataclass(frozen=True)
+class GeneratorCondition: ctx_feats, rays_ctx, rays_tgt, prev=None
+def build_condition(ctx_feats, ctx_T_tgt, K_ctx, tgt_T, K_tgt, *, encoder_res, drone_res, tgt_patch, prev=None) -> GeneratorCondition
+def math_attention_ctx(enabled: bool = True) -> ContextManager[None]  # M5 JVP 数学注意力开关
 class Generator(nn.Module):
-    def forward(self, x_t, t, r, ctx, rays_tgt, prev=None) -> Tensor   # x_hat，x-prediction
+    def forward(self, x_t, t, ctx_feats, rays_ctx, rays_tgt, *, r=None, prev=None, use_math_attn=None, dropout_generator=None) -> Tensor  # x_hat
 # sampler.py（M3）
-def sample(gen, cond, steps: int, kind: Literal["fm", "meanflow"], generator=None) -> Tensor
+def sample(gen, cond, steps: int = 50, kind: Literal["fm", "meanflow"] = "fm", generator=None) -> Tensor
 ```
 
 **生成器内部张量流**（默认 128×128，patch 8，dim 512）
 
 ```
-x_t (B,3,128,128) ── patchify(8) ──► (B,256,192) ─ Linear→512 ─ + pos + plucker(tgt) ─┐
-prev (B,3,128,128) ─ 同上 ─► prev tokens (B,256,512)（带噪；缺省则无）                    │
-ctx feats (B,2,4,N,768) ─ Linear→512 ─ + plucker(ctx) + cam/time emb ─► (B,≤512,512)    │
-t / (r,t) ─ sinusoidal ─ MLP ─► c (B,512)  → AdaLN 调制                                  │
+x_t (B,3,128,128) ── patchify(8) ──► (B,256,192) ─ Linear→512 ─ + pos + ray_embed(tgt) ──┐
+prev (B,3,128,128) ─ 同上 ─► prev tokens (B,256,512)（M4 实现；M3 为 None）               │
+ctx feats (B,2,4,N,768) ─ Linear→512 ─ + ray_embed(ctx) + cam/time emb ─► (B,≤512,512)   │
+t / (r,t) ─ sinusoidal ─ t_mlp + dt_mlp(t-r) ─► c (B,512)  → AdaLN 调制                   │
                                                                                          ▼
-          [ DiT block × depth ]  self-attn(目标[+prev]) → cross-attn(ctx) → MLP   （AdaLN-Zero）
+          [ DiT block × depth ]  self-attn(QK-Norm) → cross-attn(ctx, QK-Norm) → MLP （AdaLN-Zero）
                                                                                          │
           Linear → (B,256,192) ─ unpatchify ─► x_hat (B,3,128,128)    # x-prediction
 ```
-- 注意力统一用 `F.scaled_dot_product_attention`；MeanFlow 的 JVP 路径通过一个模块级开关切到数学注意力（见 ADR-4）。
+- 注意力统一用 `F.scaled_dot_product_attention`；MeanFlow 的 JVP 路径通过 `math_attention_ctx` 或 `use_math_attn=True` 切到数学注意力（见 ADR-4）。
 - 训练目标由 `train/losses.py` 把 `x_hat` 与目标图像换算成各阶段损失，**生成器本身不含损失**。
 
 ### 5.5 `train`
 
 ```python
 # losses.py
-def loss_regress(x_hat, x1) -> Tensor
-def loss_fm(gen, batch, ...) -> Tensor          # x 空间 MSE + λ·LPIPS
-def loss_meanflow(gen, batch, variant: Literal["pmf", "emf"], ...) -> Tensor
-def loss_aux_cross_cam(...) -> Tensor
+class LpipsLoss(nn.Module)                                            # 显式关闭外层 autocast，保持 VGG fp32
+def sample_fm_inputs(x1, *, generator=None) -> tuple[Tensor, Tensor]  # 线性插值构造 (x_t, t)
+def x_prediction_loss_breakdown(x_hat, x1, *, lpips_fn=None, lpips_weight=0.0) -> tuple[Tensor, float, float]
+def loss_regress(x_hat, x1, ...) -> Tensor
+def loss_fm(gen, x1, cond, ...) -> Tensor                             # x 空间 MSE + λ·LPIPS
+def loss_meanflow(gen, batch, variant: Literal["pmf", "emf"], ...) -> Tensor  # （M5）
+def loss_aux_cross_cam(...) -> Tensor                                 # （M6）
 # loop.py
-def run(cfg: Config, stage: str, run_dir: Path, resume: bool, overfit_seed: int | None) -> None
+def run(cfg: Config, stage: Literal["regress", "fm"], run_dir: Path, *, resume=False, overfit_seed=None, ...) -> Path
 ```
-- `loop.py` 负责：构建模型/数据、优化器、EMA、AMP（经 `device.autocast_ctx`）、日志、checkpoint、resume。
+- `loop.py` 负责：构建模型/数据、优化器、EMA、AMP（模型前向走 `device.autocast_ctx`，损失在上下文外以 fp32 计算）、日志、checkpoint、resume。
 - 阶段差异只体现在"用哪个损失 + 哪些条件被启用"，循环本身不分叉。
-- checkpoint 内容：`model`、`ema`、`optimizer`、`step`、`config`（YAML 字符串）、`git_hash`、`versions`。
+- checkpoint 内容：`stage`、`step`、`model`、`ema`、`optimizer`、`model_meta`、`config`（YAML 字符串）、`git_hash`、`versions`。
 
 ### 5.6 `evaluate`
 
@@ -400,12 +409,15 @@ def run(cfg: Config, stage: str, run_dir: Path, resume: bool, overfit_seed: int 
 def to_unit_range(images: Tensor) -> Tensor
 def lpips_score(a, b, *, metric=None) -> Tensor;  def psnr(a, b) -> Tensor;  def ssim(a, b) -> Tensor
 def baseline_copy_nearest_cam(sample: Sample) -> Tensor
+def load_checkpoint_model(checkpoint_path, *, use_ema=True, device=None) -> tuple[str, EvalModel, bool]
+def predict_batch(stage, model, batch, *, steps=50, limit=None, generator=None) -> Tensor
 def evaluate_copy_nearest_cam(cfg, *, split="val", ...) -> EvalReport
-def evaluate_checkpoint(checkpoint_path, cfg, *, split="val", use_ema=True, ...) -> EvalReport
+def evaluate_checkpoint(checkpoint_path, cfg, *, split="val", use_ema=True, steps=50, ...) -> EvalReport
 def bucketize(meta, T_tgt) -> dict[str, str]        # 距离/高度/转弯角速度/弹簧臂与遮挡状态（M7）
 def measure_latency(gen, cond, steps, device, warmup=10, iters=50) -> dict  # （M5）
-# report.py（M7）
-def build_report(results, out_dir) -> None           # report.json + 对比图
+# report.py（M3 对比图导出，M7 扩展汇总报告）
+def sample_checkpoint(checkpoint_path, cfg, *, seed, step=1, drone_index=0, steps=50, out_dir=..., ...) -> dict[str, Path]
+def build_report(results, out_dir) -> None           # report.json + 对比图（M7）
 ```
 
 ---

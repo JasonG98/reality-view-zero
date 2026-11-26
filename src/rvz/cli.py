@@ -19,6 +19,7 @@ from rvz.data.features import cache_features, feature_cache_dir
 from rvz.data.viz import viz_episode
 from rvz.doctor import run_doctor  # 须晚于 MUJOCO_GL 设置
 from rvz.evaluate.metrics import EvalReport, evaluate_checkpoint, evaluate_copy_nearest_cam
+from rvz.evaluate.report import sample_checkpoint
 from rvz.models.encoder import FrozenEncoder
 from rvz.sim.record import generate_many
 from rvz.train.loop import StageName
@@ -142,7 +143,7 @@ class TrainCommand:
     """统一训练入口（SPEC §6、§9）。
 
     Args:
-        stage: 训练阶段（当前支持 regress）。
+        stage: 训练阶段（regress / fm）。
         run: 运行名或目录（单个名称自动写入 runs/<name>）。
         config: YAML 配置路径。
         resume: 从 <run_dir>/ckpt/latest.pt 恢复训练。
@@ -162,6 +163,38 @@ class TrainCommand:
 
 
 @dataclass(frozen=True)
+class SampleCommand:
+    """用 checkpoint 对指定 episode/step/drone 采样并导出对比图（SPEC §9）。
+
+    Args:
+        checkpoint: checkpoint 路径。
+        seed: episode 随机种子。
+        step: 时刻下标（>= 1）。
+        drone_index: 无人机下标（从 0 开始）。
+        steps: fm 采样步数（默认 50）。
+        out: 输出目录。
+        use_ema: 优先使用 EMA 权重。
+        sample_seed: 初始高斯噪声随机种子。
+        config: YAML 配置路径。
+        overrides: 覆盖配置项。
+    """
+
+    checkpoint: str
+    seed: int
+    step: int = 1
+    drone_index: int = 0
+    steps: int = 50
+    out: str = "runs/samples/latest"
+    use_ema: bool = True
+    sample_seed: int = 0
+    config: str | None = None
+    overrides: Annotated[
+        tyro.conf.UseAppendAction[list[str]],
+        tyro.conf.arg(name="set", metavar="a.b.c=value"),
+    ] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class EvalCommand:
     """评估基线或 checkpoint，在指定划分上计算 LPIPS/PSNR/SSIM 并写 report.json。
 
@@ -173,6 +206,7 @@ class EvalCommand:
         seeds: 可选 half-open seed 范围 a:b，覆盖 split。
         out: report.json 输出目录，缺省为 runs/eval_<name>。
         use_ema: 评估 checkpoint 时优先使用 EMA 权重。
+        steps: fm 采样步数（默认 50）。
         max_samples: 可选最大评估样本数。
         overrides: 覆盖配置项。
     """
@@ -184,6 +218,7 @@ class EvalCommand:
     seeds: str | None = None
     out: str | None = None
     use_ema: bool = True
+    steps: int = 50
     max_samples: int | None = None
     overrides: Annotated[
         tyro.conf.UseAppendAction[list[str]],
@@ -239,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
             "viewer": ViewerCommand,
             "cache-feats": CacheFeatsCommand,
             "train": TrainCommand,
+            "sample": SampleCommand,
             "eval": EvalCommand,
         },
         prog="rvz",
@@ -281,6 +317,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"训练完成：{ckpt_path}")
         return 0
+    if isinstance(command, SampleCommand):
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s：%(message)s")
+        outputs = sample_checkpoint(
+            command.checkpoint,
+            cfg,
+            seed=command.seed,
+            step=command.step,
+            drone_index=command.drone_index,
+            steps=command.steps,
+            out_dir=command.out,
+            use_ema=command.use_ema,
+            sample_seed=command.sample_seed,
+        )
+        for name, path in outputs.items():
+            print(f"{name}: {path}")
+        return 0
     if isinstance(command, EvalCommand):
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s：%(message)s")
         if (command.baseline is None) == (command.checkpoint is None):
@@ -305,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                 seeds=seeds,
                 out_dir=out_dir,
                 use_ema=command.use_ema,
+                steps=command.steps,
                 max_samples=command.max_samples,
             )
         _print_eval_report(eval_report, out_dir)

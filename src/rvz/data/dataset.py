@@ -197,7 +197,7 @@ class EpisodeDataset(Dataset[Sample]):
         use_cache: bool = True,
         cache_dir: str | Path | None = None,
         seeds: Sequence[int] | None = None,
-        max_cached_episodes: int = 32,
+        max_cached_episodes: int = 512,
     ) -> None:
         if max_cached_episodes <= 0:
             raise ValueError("max_cached_episodes 必须为正整数")
@@ -233,9 +233,12 @@ class EpisodeDataset(Dataset[Sample]):
                     raise FileNotFoundError(f"缺少特征缓存文件：{feat_path}")
                 feats_mmap = np.load(feat_path, mmap_mode="r", allow_pickle=False)
                 expected_shape = (num_steps, 4, self.manifest.num_patches, self.manifest.embed_dim)
-                if feats_mmap.dtype != np.float16 or tuple(feats_mmap.shape) != expected_shape:
+                actual_shape = tuple(feats_mmap.shape)
+                actual_dtype = feats_mmap.dtype
+                del feats_mmap
+                if actual_dtype != np.float16 or actual_shape != expected_shape:
                     raise ValueError(
-                        f"特征缓存 {feat_path} 形状/类型异常：actual=({feats_mmap.shape}, {feats_mmap.dtype}) "
+                        f"特征缓存 {feat_path} 形状/类型异常：actual=({actual_shape}, {actual_dtype}) "
                         f"!= expected=({expected_shape}, float16)"
                     )
 
@@ -260,10 +263,19 @@ class EpisodeDataset(Dataset[Sample]):
 
         self._max_cached = max_cached_episodes
         self._rgb_cache: OrderedDict[int, tuple[np.ndarray, np.ndarray | None]] = OrderedDict()
+        # 延迟缓存各 episode 的 .npy mmap 句柄，避免多 worker fork 前持有打开的文件描述符。
+        self._feat_cache: OrderedDict[int, np.ndarray] = OrderedDict()
 
     @property
     def seeds(self) -> list[int]:
         return [ep.seed for ep in self._episodes]
+
+    def find_index(self, seed: int, step: int, drone_index: int) -> int:
+        """定位指定 `(seed, step, drone_index)` 在数据集中的样本下标。"""
+        for idx, (ep_idx, t_val, m_val) in enumerate(self._index):
+            if self._episodes[ep_idx].seed == seed and t_val == step and m_val == drone_index:
+                return idx
+        raise ValueError(f"数据集中找不到 seed={seed}, step={step}, drone_index={drone_index}")
 
     def __len__(self) -> int:
         return len(self._index)
@@ -283,6 +295,19 @@ class EpisodeDataset(Dataset[Sample]):
             self._rgb_cache.popitem(last=False)
         return entry
 
+    def _load_feats_mmap(self, ep_idx: int) -> np.ndarray:
+        cached = self._feat_cache.get(ep_idx)
+        if cached is not None:
+            self._feat_cache.move_to_end(ep_idx)
+            return cached
+        ep = self._episodes[ep_idx]
+        assert ep.feat_path is not None
+        feats_mmap = np.load(ep.feat_path, mmap_mode="r", allow_pickle=False)
+        self._feat_cache[ep_idx] = feats_mmap
+        if len(self._feat_cache) > self._max_cached:
+            self._feat_cache.popitem(last=False)
+        return feats_mmap
+
     def __getitem__(self, index: int) -> Sample:
         ep_idx, t, m = self._index[index]
         ep = self._episodes[ep_idx]
@@ -298,8 +323,7 @@ class EpisodeDataset(Dataset[Sample]):
         ctx_feats: torch.Tensor | None = None
         ctx_rgb: torch.Tensor | None = None
         if self.use_cache:
-            assert ep.feat_path is not None
-            feats_mmap = np.load(ep.feat_path, mmap_mode="r", allow_pickle=False)
+            feats_mmap = self._load_feats_mmap(ep_idx)
             ctx_feats = torch.from_numpy(np.array(feats_mmap[t - 1 : t + 1], dtype=np.float32, copy=True))
         else:
             assert robot_rgb is not None
@@ -339,4 +363,5 @@ def make_dataset(
         use_cache=use_cache,
         cache_dir=resolved_cache,
         seeds=seeds,
+        max_cached_episodes=cfg.data.max_cached_episodes,
     )
